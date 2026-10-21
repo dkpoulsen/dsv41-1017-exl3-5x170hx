@@ -23,10 +23,10 @@ Three sets of changes make the full **1,048,576-token FP16 context + DSpark MTP 
 | Free / available host RAM | ~29 GiB free | **105 GiB free (206 GiB avail)** | ~29 GiB free | 124 GiB free | **124 GiB free** |
 | Model load time | ~285 s | ~285 s | 192.7 s | 192.7 s | **157.5 s** |
 | VRAM per GPU (GiB) | 47.3, 44.6×4 | 47.3, 44.6×4 | 48.4, 50.6, 51.4, 48.4, **17.7** | 48.4, 50.6, 51.4, 48.4, 17.7 | **40.8, 30.8, 43.8, 41.3, 51.8** |
-| **Decode: `utf8_len` (C code)** | 71.8 tok/s | **82.9–91.8 tok/s** | 48.4 tok/s | 46.4 tok/s | **59.3–60.2 tok/s (+24%)** |
-| **Decode: `review` (600 tok)** | 55.5 tok/s | **50.5–58.0 tok/s** | 32.7 tok/s | 33.8 tok/s | **42.2 tok/s (+29%)** |
-| **Decode: `agreement` (prose)** | — | **76.9 tok/s** | 44.1 tok/s | 45.6 tok/s | **47.4–54.0 tok/s (+22%)** |
-| **Decode: `reason` (math)** | — | **95.6 tok/s** | 52.6 tok/s | 58.3 tok/s | **59.6–64.2 tok/s (+22%)** |
+| **Decode: `utf8_len` (C code)** | 71.8 tok/s | **82.9–91.8 tok/s** | 48.4 tok/s | 46.4 tok/s | **64.2–65.4 tok/s (+35–48%)** |
+| **Decode: `review` (600 tok)** | 55.5 tok/s | **50.5–58.0 tok/s** | 32.7 tok/s | 33.8 tok/s | **45.7 tok/s (+40%)** |
+| **Decode: `agreement` (prose)** | — | **73.1–76.9 tok/s** | 44.1 tok/s | 45.6 tok/s | **51.3–54.0 tok/s (+22%)** |
+| **Decode: `reason` (math)** | — | **86.4–95.6 tok/s** | 52.6 tok/s | 58.3 tok/s | **70.3 tok/s (+34%)** |
 | **Cold prefill ~55K** | 883.8 tok/s (64.9 s) | 823.4 tok/s (67.8 s) | 1,235.0 tok/s (44.3 s) | 1,244.5 tok/s (44.3 s) | **2,572.7 tok/s (21.7 s, 2.08×)** |
 | **Cold prefill ~255K** | 908.2 tok/s (292.6 s) | **935.8 tok/s** (275.3 s) | 1,436.3 tok/s (176.3 s) | 1,420.5 tok/s (179.6 s) | **2,447.6 tok/s (105.3 s, 1.70×)** |
 | **Cold prefill 1.04M** | 832.6 tok/s (20.9 min) | — | 1,264.5 tok/s (13.8 min) | — | *~2,400 tok/s (~7.2 min est.)* |
@@ -132,12 +132,21 @@ With `cmpunlocker` P2P active across all 5 CMP 170HX cards, `canDeviceAccessPeer
 ### D. Fused `exl3_mgemm` Projection Fans (`patches/dsv4.py`, `patches/dspark.py`)
 Enabled `x_fan` (`[q_a, wkv]` / `[q_a, wkv, comp.wkv, comp.wgate]`) and `q_fan` (`[q_b, idx_wq_b]`) when `q_head_norm=False` (DeepSeek-V4.1), and replaced the 8-slice Python `wo_a` loop in `DSparkAttention.forward` with `self._project_o_grouped` (`exl3_mgemm`).
 
+### E. Optimized `exl3_moe_coop` CUDA Kernels (`patches/moe_coop/`)
+Applied the 4 targeted MoE kernel optimizations from `GNmac-lab`:
+1. **MMA Operand Swap (`patch_coop_mma_swap.py`)**: Transposed the operand assignments in `mma.sync.m16n8k16` so decoded weights feed the $A$ operand and activations feed the $B$ operand, cutting from two MMAs with zero padding to **one MMA per 16×16 tile** without padding (`gate/up -12.7%, down -12%`).
+2. **Branch-Free Loop (`patch_coop_branchfree.py`)**: Eliminated divergent branch bookkeeping in the prefetch ring loop for 2, 3, and 4 bpw register-decode widths.
+3. **512-Column Down Tiles (`patch_coop_down_wide16.py`)**: Sized down-projection tiles with 16 warps along $N$, eliminating cross-warp reductions on the short $K=512$ down stage (`102.5 → 87.2 µs`).
+4. **Parallel Chunk Epilogue (`patch_coop_down_epilogue.py`)**: Parallelized completion counters and chunk accumulation.
+
+Together, these pushed single-stream decode on `c_code` from **44.2 → 65.4 tok/s (+48%)**, `review` from **33.6 → 45.7 tok/s (+36%)**, and `reason` from **52.6 → 70.3 tok/s (+34%)** while preserving byte-exact greedy outputs.
+
 ---
 
 ## Repository Layout
 
 - `build/` — `Containerfile`, `headers.py`, `check_engine.py`, `get_engine.sh`, `make_view.py`, `chat_template.jinja`, `tokenizer_config.json`
-- `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, and the 7 patched engine modules (`ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
-- `serving/` — `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
-- `bench/` — `bench_ab.py`, `compare.py`, `capture_ref.py`
-- `results/` — `results-tp5*.json`, `results-pp5*.json`, `ref-*.json`, `convert.log`
+- `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, `moe_coop/` (the 4 C++/CUDA MoE kernel patches + unified diffs), and the 8 patched engine modules (`generator.py`, `ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
+- `serving/` — `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS systemd service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
+- `bench/` — `bench_ab.py`, `bench_conc.py`, `compare.py`, `capture_ref.py`
+- `results/` — `results-tp5*.json`, `results-pp5*.json`, `results-conc-*.json`, `ref-*.json`, `convert.log`

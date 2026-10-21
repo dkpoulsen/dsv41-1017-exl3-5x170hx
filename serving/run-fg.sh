@@ -19,6 +19,11 @@ sudo -u dkp env HOME=/home/dkp XDG_RUNTIME_DIR=/run/user/1002 PATH=/run/wrappers
   -e EXL3_NGRAM_STREAM=${NGRAM_STREAM:-0} \
   -e EXL3_NGRAM_LOCK=${NGRAM_LOCK:-0} \
   -e EXL3_LAYERS_PER_DEVICE=${LAYERS_PER_DEVICE:-8,6,10,8,8} \
+  -e EXL3_MOE_FUSED_ROWS_WIDE=512 \
+  -e EXL3_PROF=${EXL3_PROF:-0} \
+  -e EXL3_GEN_PROF=${EXL3_GEN_PROF:-0} \
+  -v /home/dkp/serve-mia/native-opt:/engine/native:ro \
+  -v $P/generator.py:$E/generator/generator.py:ro \
   -v $P/ngram_embedding.py:$E/modules/ngram_embedding.py:ro \
   -v $P/deepseek_v41_mod.py:$E/modules/arch_specific/deepseek_v41.py:ro \
   -v $P/dsv4.py:$E/modules/dsv4.py:ro \

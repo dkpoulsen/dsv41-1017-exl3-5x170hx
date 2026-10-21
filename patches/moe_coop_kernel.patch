@@ -1,0 +1,315 @@
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh.orig	2026-10-21 20:08:55.455864753 +0200
++++ /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh	2026-10-21 20:08:55.530387130 +0200
+@@ -38,15 +38,17 @@
+ constexpr int THREADS = WK * 32;
+ constexpr int COLS = WNT * 16;                  // columns per warp
+ constexpr int ROWS = 8;                         // slots of one expert per block (MMA rows)
+-template <bool WIDE> constexpr int tile_wn() { return WIDE ? 4 : 1; }          // warps along n
+-template <bool WIDE> constexpr int tile_wk() { return WK / tile_wn<WIDE>(); }  // warps along k
+-template <bool WIDE> constexpr int tile_cols() { return tile_wn<WIDE>() * COLS; }
+-template <bool WIDE> constexpr int tile_gpc() { return tile_cols<WIDE>() >= 128 ? 1 : 128 / tile_cols<WIDE>(); }  // block groups per 128-chunk
+-template <bool WIDE> constexpr int tile_cpb() { return tile_cols<WIDE>() >= 128 ? tile_cols<WIDE>() / 128 : 1; }  // 128-chunks per block
++// dsv41 (patch_coop_down_wide16.py): geometry 2 = 16 warps along n, no in-block k split (down stage)
++template <int WIDE> constexpr int tile_wn() { return WIDE == 2 ? 16 : WIDE ? 4 : 1; }          // warps along n
++template <int WIDE> constexpr int tile_wk() { return WK / tile_wn<WIDE>(); }  // warps along k
++template <int WIDE> constexpr int tile_cols() { return tile_wn<WIDE>() * COLS; }
++template <int WIDE> constexpr int tile_gpc() { return tile_cols<WIDE>() >= 128 ? 1 : 128 / tile_cols<WIDE>(); }  // block groups per 128-chunk
++template <int WIDE> constexpr int tile_cpb() { return tile_cols<WIDE>() >= 128 ? tile_cols<WIDE>() / 128 : 1; }  // 128-chunks per block
+ constexpr int MAX_SLOTS = 256;                  // MAX_BSZN * top_k bound (top_k <= 32)
+ constexpr int STAGE_WORDS = WNT * 8 * 8;        // words per warp per k-slice at 8 bpw
+ constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
+ 
++static_assert(tile_wk<2>() * tile_cols<2>() == WK * COLS, "down tile reduction buffer");
+ static_assert(THREADS == MOE_COOP_THREADS, "block size mismatch");
+ 
+ // Register-dequant widths (shuffle extraction, no staging). 3 bpw stays on the staged generic
+@@ -68,7 +70,8 @@
+ template <int bits, bool HALF = false>
+ __host__ __device__ constexpr int smem_stage_bytes() { return tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS * 4 : 0; }
+ constexpr int smem_red_bytes() { return WK * ROWS * COLS * 4; }   // same for both geometries: wk x ROWS x cols
+-constexpr int smem_part_bytes() { return WK * 128 * 4; }
++constexpr int SLOTS_EPI = 8;  // dsv41 (patch_coop_down_epilogue.py): per-slot partials, top_k <= 8
++constexpr int smem_part_bytes() { return (WK * 128 > 4 * SLOTS_EPI * 128 ? WK * 128 : 4 * SLOTS_EPI * 128) * 4; }
+ template <int bits, bool HALF = false>
+ __host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes() + smem_stage_bytes<bits, HALF>(); }
+ template <int bits, bool HALF = false>
+@@ -337,7 +340,26 @@
+ // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
+ // dq_dispatch
+ 
+-template <int bits, int cb, bool WIDE, bool HALF = false>
++// dsv41 (ds41-patches/patch_coop_mma_swap.py): D(16 cols x 8 rows) += W^T(16 x 16 k) X(16 k x 8 rows), the
++// weight tile as the A operand: a = {f0[0], f1[0], f0[1], f1[1]} (cols lane/4 and +8, k pairs 2(lane%4) and +8),
++// b = the activation words (k pairs 2(lane%4) and +8 of row lane/4)
++__device__ __forceinline__ void mma_wt_h(const FragB& f0, const FragB& f1, const FragB& x, FragC_h& c)
++{
++    const uint32_t* w0 = reinterpret_cast<const uint32_t*>(&f0);
++    const uint32_t* w1 = reinterpret_cast<const uint32_t*>(&f1);
++    const uint32_t* xb = reinterpret_cast<const uint32_t*>(&x);
++    uint32_t* cc = reinterpret_cast<uint32_t*>(&c);
++    asm
++    (
++        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
++        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
++        : "+r"(cc[0]), "+r"(cc[1])
++        :  "r"(w0[0]), "r"(w1[0]), "r"(w0[1]), "r"(w1[1]),
++           "r"(xb[0]), "r"(xb[1])
++    );
++}
++
++template <int bits, int cb, int WIDE, bool HALF = false>
+ __device__ __forceinline__ void gemv_tile
+ (
+     const uint32_t* __restrict__ B32,
+@@ -425,6 +447,86 @@
+     FragC_h ch[WNT][2] = {};
+     float2 acc0[WNT][2] = {};
+ 
++    // dsv41 (ds41-patches/patch_coop_branchfree.py): register-decode widths run the full PF groups without
++    // per-slice guards (prefetch index clamped; re-reads past the end are never consumed), then the last
++    // myn % PF slices with direct loads. Same loads, products and fold order: bit-identical results.
++    if constexpr (REG && !HALF)
++    {
++        const half2* arow = A2 + a_row0 + (size_t) ks0 * 8 + (lane & 3);
++        auto tile_step = [&] (const int i, const uint32_t* bw)
++        {
++            FragB xb;
++            xb[0] = r0_ok ? arow[(size_t) i * 8] : hzero;
++            xb[1] = r0_ok ? arow[(size_t) i * 8 + 4] : hzero;
++            #pragma unroll
++            for (int t = 0; t < WNT; ++t)
++            {
++                FragB f0, f1;
++                if constexpr (bits == 4)
++                {
++                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
++                    exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
++                }
++                else if constexpr (bits == 2)
++                {
++                    const uint32_t w = bw[t >> 1];
++                    const int base = (t & 1) << 4;
++                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
++                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
++                    exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
++                }
++                else  // bits == 3
++                {
++                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
++                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
++                    exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
++                }
++
++                mma_wt_h(f0, f1, xb, ch[t][0]);
++            }
++        };
++        auto fold = [&] ()
++        {
++            #pragma unroll
++            for (int t = 0; t < WNT; ++t)
++                #pragma unroll
++                for (int f = 0; f < 2; ++f)
++                {
++                    acc0[t][f].x += __low2float(ch[t][0][f]);
++                    acc0[t][f].y += __high2float(ch[t][0][f]);
++                    ch[t][0][f] = hzero;
++                }
++        };
++        static_assert(PF % FOLD == 0, "fold cadence");
++        const int full = myn - myn % PF;
++        for (int ib = 0; ib < full; ib += PF)
++        {
++            #pragma unroll
++            for (int d = 0; d < PF; ++d)
++            {
++                uint32_t bw[LOADS];
++                #pragma unroll
++                for (int l = 0; l < LOADS; ++l)
++                    bw[l] = pf[d][l];
++                const int nx = min(ib + d + PF, myn - 1);
++                #pragma unroll
++                for (int l = 0; l < LOADS; ++l)
++                    pf[d][l] = ld_b(nx, l);
++                tile_step(ib + d, bw);
++                if ((d + 1) % FOLD == 0) fold();
++            }
++        }
++        for (int i = full; i < myn; ++i)
++        {
++            uint32_t bw[LOADS];
++            #pragma unroll
++            for (int l = 0; l < LOADS; ++l)
++                bw[l] = ld_b(i, l);
++            tile_step(i, bw);
++        }
++        if (myn % FOLD) fold();
++    }
++    else
+     for (int ib = 0; ib < myn; ib += PF)
+     {
+         #pragma unroll
+@@ -512,7 +614,23 @@
+ 
+     // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
+     // tile*16 + frag*8 + 2*(l%4) (+1)
+-    if (r0_ok)
++    if constexpr (REG && !HALF)
++    {
++        // rows >= nrows hold zeros (their activations were zero) and are never read below
++        const int rr = 2 * (lane & 3);
++        float* red0 = sh_red + (wk * ROWS + rr) * TCOLS + wn * COLS;
++        float* red1 = red0 + TCOLS;
++        #pragma unroll
++        for (int t = 0; t < WNT; ++t)
++            #pragma unroll
++            for (int f = 0; f < 2; ++f)
++            {
++                const int col = t * 16 + f * 8 + (lane >> 2);
++                red0[col] = acc0[t][f].x;
++                red1[col] = acc0[t][f].y;
++            }
++    }
++    else if (r0_ok)
+     {
+         const int c0 = 2 * (lane & 3);
+         float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
+@@ -813,9 +931,10 @@
+ __global__ __launch_bounds__(THREADS)
+ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+ {
+-    constexpr int TCOLS = tile_cols<WIDE>();
+-    constexpr int GPC = tile_gpc<WIDE>();
+-    constexpr int CPB = tile_cpb<WIDE>();
++    constexpr int GB = WIDE ? 2 : 0;  // dsv41: 512-column tiles for the short-k down stage
++    constexpr int TCOLS = tile_cols<GB>();
++    constexpr int GPC = tile_gpc<GB>();
++    constexpr int CPB = tile_cpb<GB>();
+     extern __shared__ uint32_t smem_dyn[];
+     float* sh_red = (float*) smem_dyn;
+     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
+@@ -849,10 +968,124 @@
+     {
+         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
+         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
+-        gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
++        gemv_tile<bits, cb, GB, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+     }
+ 
++    if constexpr (CPB > 1)
++    {
++        // dsv41 (patch_coop_down_epilogue.py): finish every last-arrival chunk of this block at once, WPC warps per
++        // chunk; per-slot partials [CPB][SLOTS_EPI][128] in sh_part, summed in slot order by one warp per chunk
++        constexpr int WPC = WK / CPB;
++        static_assert(CPB * SLOTS_EPI * 128 * 4 <= smem_part_bytes(), "slot partials");
++        __shared__ int sh_last[CPB];
++        const int jw = warp / WPC;
++        const int wi = warp % WPC;
++        for (int r = 0; r < nrows; ++r)
++        {
++            const int s = sh_rows[r];
++            const int row = s / p.topk;
++            if (threadIdx.x == 0)
++            {
++                int n = 0;
++                for (int kk = 0; kk < p.topk; ++kk)
++                    n += slot_info(p, row * p.topk + kk).active ? 1 : 0;
++                sh_n_active = n;
++            }
++            __threadfence();
++            __syncthreads();
++            if (threadIdx.x < CPB)
++                sh_last[threadIdx.x] = atomicAdd(p.ctr_b + (size_t) row * (p.Ho / 128) + (group * CPB + threadIdx.x) / GPC, 1)
++                                       == sh_n_active * GPC * p.ksplit_b - 1;
++            __syncthreads();
++            bool any = false;
++            #pragma unroll
++            for (int j = 0; j < CPB; ++j) any |= sh_last[j] != 0;
++            if (!any || (p.dbg & 2)) continue;
++            __threadfence();
++
++            if (p.sh_gate_w)
++            {
++                const half* xr = p.x + (size_t) row * p.x_stride;
++                float dot = 0.0f;
++                for (int i = threadIdx.x * 2; i < p.H; i += THREADS * 2)
++                {
++                    half2 xv = *((const half2*) (xr + i));
++                    half2 wv = *((const half2*) (p.sh_gate_w + i));
++                    dot += __low2float(xv) * __low2float(wv) + __high2float(xv) * __high2float(wv);
++                }
++                #pragma unroll
++                for (int o = 16; o > 0; o >>= 1)
++                    dot += __shfl_xor_sync(0xffffffffu, dot, o);
++                if (lane == 0) sh_part[warp] = dot;
++                __syncthreads();
++                if (threadIdx.x == 0)
++                {
++                    float tt = 0.0f;
++                    for (int w = 0; w < WK; ++w) tt += sh_part[w];
++                    sh_gate = 1.0f / (1.0f + __expf(-tt));
++                }
++                __syncthreads();
++            }
++
++            const bool mine = sh_last[jw] != 0;
++            const int chunk = (group * CPB + jw) / GPC;
++            const int col = chunk * 128 + lane * 4;
++            float* slot_part = sh_part + (size_t) jw * SLOTS_EPI * 128 + lane * 4;
++            if (mine)
++                for (int kk = wi; kk < p.topk; kk += WPC)
++                {
++                    const int sk = row * p.topk + kk;
++                    const SlotInfo sj = slot_info(p, sk);
++                    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
++                    if (sj.active)
++                    {
++                        for (int q = 0; q < p.ksplit_b; ++q)
++                        {
++                            float t0, t1, t2, t3;
++                            load_f4_cg(p.d_out + ((size_t) q * (p.bsz * p.topk) + sk) * p.Ho + col, t0, t1, t2, t3);
++                            v0 += t0; v1 += t1; v2 += t2; v3 += t3;
++                        }
++                        had128(v0, v1, v2, v3, lane);
++                        scale_h4(((const half*) p.d_svh[sj.local]) + col, v0, v1, v2, v3);
++                        if (p.d_bias) add_h4(((const half*) p.d_bias[sj.local]) + col, v0, v1, v2, v3);
++                        v0 = 0.0f + sj.w * v0; v1 = 0.0f + sj.w * v1; v2 = 0.0f + sj.w * v2; v3 = 0.0f + sj.w * v3;
++                    }
++                    float* sp = slot_part + kk * 128;
++                    sp[0] = v0; sp[1] = v1; sp[2] = v2; sp[3] = v3;
++                }
++            __syncthreads();
++            if (mine && wi == 0)
++            {
++                float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++                for (int kk = 0; kk < p.topk; ++kk)
++                {
++                    const float* q = slot_part + kk * 128;
++                    o0 += q[0]; o1 += q[1]; o2 += q[2]; o3 += q[3];
++                }
++                if (p.sh_out)
++                {
++                    const float gv = p.sh_gate_w ? sh_gate : 1.0f;
++                    const float* sh = p.sh_out + (size_t) row * p.H + col;
++                    if (col + 0 < p.H) o0 += gv * sh[0];
++                    if (col + 1 < p.H) o1 += gv * sh[1];
++                    if (col + 2 < p.H) o2 += gv * sh[2];
++                    if (col + 3 < p.H) o3 += gv * sh[3];
++                }
++                float* dst = p.out + (size_t) row * p.out_stride + col;
++                if (col + 3 < p.H_out)
++                    *((float4*) dst) = make_float4(o0, o1, o2, o3);
++                else
++                {
++                    if (col + 0 < p.H_out) dst[0] = o0;
++                    if (col + 1 < p.H_out) dst[1] = o1;
++                    if (col + 2 < p.H_out) dst[2] = o2;
++                }
++            }
++            __syncthreads();
++        }
++    }
++    else
+     for (int r = 0; r < nrows; ++r)
+     for (int j = 0; j < CPB; ++j)
+     {
