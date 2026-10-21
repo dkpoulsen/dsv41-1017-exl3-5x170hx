@@ -23,13 +23,14 @@ Three sets of changes make the full **1,048,576-token FP16 context + DSpark MTP 
 | Free / available host RAM | ~29 GiB free | **105 GiB free (206 GiB avail)** | ~29 GiB free | 124 GiB free | **124 GiB free** |
 | Model load time | ~285 s | ~285 s | 192.7 s | 192.7 s | **157.5 s** |
 | VRAM per GPU (GiB) | 47.3, 44.6×4 | 47.3, 44.6×4 | 48.4, 50.6, 51.4, 48.4, **17.7** | 48.4, 50.6, 51.4, 48.4, 17.7 | **40.8, 30.8, 43.8, 41.3, 51.8** |
-| **Decode: `utf8_len` (C code)** | 71.8 tok/s | **82.9–91.8 tok/s** | 48.4 tok/s | 46.4 tok/s | **61.5–65.4 tok/s (+39–48%)** |
-| **Decode: `review` (600 tok)** | 55.5 tok/s | **50.5–58.0 tok/s** | 32.7 tok/s | 33.8 tok/s | **44.7–45.7 tok/s (+33–36%)** |
-| **Decode: `agreement` (prose)** | — | **73.1–76.9 tok/s** | 44.1 tok/s | 45.6 tok/s | **53.1–55.3 tok/s (+20–25%)** |
-| **Decode: `reason` (math)** | — | **86.4–95.6 tok/s** | 52.6 tok/s | 58.3 tok/s | **79.6–80.7 tok/s (+51–53%)** |
-| **Cold prefill ~55K** | 883.8 tok/s (64.9 s) | 823.4 tok/s (67.8 s) | 1,235.0 tok/s (44.3 s) | 1,244.5 tok/s (44.3 s) | **2,559.3 tok/s (21.8 s, 2.07×)** |
-| **Cold prefill ~255K** | 908.2 tok/s (292.6 s) | **935.8 tok/s** (275.3 s) | 1,436.3 tok/s (176.3 s) | 1,420.5 tok/s (179.6 s) | **2,940.4 tok/s (87.6 s, 2.05×)** |
-| **Cold prefill 1.04M** | 832.6 tok/s (20.9 min) | — | 1,264.5 tok/s (13.8 min) | — | *~2,900 tok/s (~6.0 min est.)* |
+| **Decode: `utf8_len` (C code)** | 71.8 tok/s | **82.9–91.8 tok/s** | 48.4 tok/s | 46.4 tok/s | **59.8–65.4 tok/s (+35–48%)** |
+| **Decode: `review` (600 tok)** | 55.5 tok/s | **50.5–58.0 tok/s** | 32.7 tok/s | 33.8 tok/s | **44.4–45.7 tok/s (+32–36%)** |
+| **Decode: `agreement` (prose)** | — | **73.1–76.9 tok/s** | 44.1 tok/s | 45.6 tok/s | **55.1–55.9 tok/s (+25–27%)** |
+| **Decode: `reason` (math)** | — | **86.4–95.6 tok/s** | 52.6 tok/s | 58.3 tok/s | **77.8–80.7 tok/s (+48–53%)** |
+| **Cold prefill ~15K** | — | — | — | — | **1,529.3 tok/s (9.9 s)** |
+| **Cold prefill ~55K** | 883.8 tok/s (64.9 s) | 823.4 tok/s (67.8 s) | 1,235.0 tok/s (44.3 s) | 1,244.5 tok/s (44.3 s) | **2,963.5 tok/s (18.9 s, 2.40×)** |
+| **Cold prefill ~255K** | 908.2 tok/s (292.6 s) | **935.8 tok/s** (275.3 s) | 1,436.3 tok/s (176.3 s) | 1,420.5 tok/s (179.6 s) | **3,044.4 tok/s (84.8 s, 2.12×)** |
+| **Cold prefill 1.04M** | 832.6 tok/s (20.9 min) | — | 1,264.5 tok/s (13.8 min) | — | *~3,000 tok/s (~5.8 min est.)* |
 | DSML tool calling (`get_weather`) | Pass | **Pass** | Pass | Pass | **Pass** |
 | Greedy output (`agreement` & `reason`) | Reference | **Byte-identical** | **Byte-identical** | **Byte-identical** | **Byte-identical** |
 
