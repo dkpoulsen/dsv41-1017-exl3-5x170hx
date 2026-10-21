@@ -33,6 +33,25 @@ Three sets of changes make the full **1,048,576-token FP16 context + DSpark MTP 
 | DSML tool calling (`get_weather`) | Pass | **Pass** | Pass | Pass | **Pass** |
 | Greedy output (`agreement` & `reason`) | Reference | **Byte-identical** | **Byte-identical** | **Byte-identical** | **Byte-identical** |
 
+### Concurrency Scaling Benchmark (1, 2, 4, 8 Concurrent Users)
+
+Measured with `bench/bench_conc.py` on this machine (greedy, reasoning on as served, 400 max completion tokens per request, unique non-repeating prompts across requests to prevent prefix cache hits):
+
+| Users | Layout | Tokens Generated | Wall Time | Median TTFT | Median Decode | **Aggregate Decode** | **Aggregate End-to-End** |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| **1 user** | **PP5** | 287 | 5.5 s | 0.62 s | 59.1 tok/s | 59.3 tok/s | 52.5 tok/s |
+| | **TP5** | 305 | 4.1 s | 0.38 s | 81.6 tok/s | **81.8 tok/s** | **74.2 tok/s** |
+| **2 users** | **PP5** | 687 | 16.5 s | 1.30 s | 27.5 tok/s | 44.9 tok/s | 41.5 tok/s |
+| | **TP5** | 687 | 11.4 s | 0.74 s | 39.2 tok/s | **64.4 tok/s** | **60.2 tok/s** |
+| **4 users** | **PP5** | 872 | 21.0 s | 2.13 s | 20.3 tok/s | 46.0 tok/s | 41.6 tok/s |
+| | **TP5** | 873 | 12.6 s | 1.20 s | 32.1 tok/s | **76.2 tok/s** | **69.3 tok/s** |
+| **8 users** | **PP5** | 2,114 | 40.7 s | 3.64 s | 10.9 tok/s | 54.8 tok/s | 52.0 tok/s |
+| | **TP5** | 2,279 | 26.0 s | 1.99 s | 17.0 tok/s | **91.5 tok/s** | **87.5 tok/s** |
+
+#### Why TP5 scales better on multi-user decode while PP5 dominates long prefill
+- **Under TP5**: All 5 GPUs participate in every single token's matrix multiplications in parallel. Expanding batch size from 1 to 8 amortizes the HBM weight bandwidth and fills the 74 streaming multiprocessors per card, pushing aggregate decode from **81.8 tok/s → 91.5 tok/s**.
+- **Under PP5**: Pipeline parallelism splits the 40 layers sequentially across the 5 GPUs. Without micro-batch interleaving across requests (the engine batches active requests into one forward pass), only 1 GPU is executing at any given instant during a decode step. Aggregate decode is bounded by the single-card throughput of the full-layer execution (~45–55 tok/s). However, during prefill, pipelining micro-chunks across all 5 stages delivers **2,573 tok/s** (2.9× faster than TP5).
+
 ---
 
 ## Hardware vs reference recipe

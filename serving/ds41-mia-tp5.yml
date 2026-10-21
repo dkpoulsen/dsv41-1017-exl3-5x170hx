@@ -20,7 +20,7 @@ model:
   backend: exllamav3
   max_seq_len: 1048576
   cache_size: 1048576
-  max_batch_size: 1        # one recurrent slot; concurrent requests queue
+  max_batch_size: 8        # up to 8 concurrent sequences (shared 1M-token pool)
   chunk_size: 4096         # load chunk; the Generator's chunk is 16384 (TABBY_EXL3_GENERATOR_CHUNK)
   gpu_split_auto: false
   gpu_split: [45, 55, 55, 55, 55]

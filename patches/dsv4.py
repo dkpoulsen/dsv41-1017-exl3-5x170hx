@@ -3,6 +3,7 @@ from typing_extensions import override
 import math
 import torch
 import os
+import time
 import torch.nn.functional as F
 from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
@@ -19,6 +20,9 @@ from .multilinear import MultiLinear
 from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds, dsa_indexer_dtype, \
     dsa_indexer_keys, INDEXER_QUANT_MIN_ROWS
 from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
+
+_prof = os.environ.get("EXL3_PROF", "0") != "0"
+_prof_acc = {"proj": 0.0, "jobs": 0.0, "n": 0, "attn": 0.0, "comp": 0.0, "idx": 0.0, "o": 0.0}
 
 # Multi-job decode via the batched path: one projection pass, one MULTIROW attention
 # call and one grouped o_proj over all rows (per-slot state addressed through slot-id /
@@ -1075,7 +1079,7 @@ class DSV4Attention(Module):
     def _fan_outs(self, fan, tag, seq, shapes):
         """Per-(seq) fan output scratch + pointer array, cached (g_tensor_cache reuses the
         same storage per shape, so the pointer arrays stay valid)."""
-        key = (tag, seq)
+        key = (tag, seq, tuple(shapes))
         ent = self._fan_scratch.get(key)
         if ent is None:
             device = torch.device(self.device)
@@ -1415,7 +1419,7 @@ class DSV4Attention(Module):
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
                 kl = kl, bt_row = bt[:1] if bt is not None else None)
-        if not dsv4_batch_eager or not self.q_head_norm:
+        if not dsv4_batch_eager:
             # Per-job loop: each job dispatches into its per-slot whole-step graph (or the
             # eager core). Measured faster than the batched-eager path below at bsz 2-8 --
             # graph replays beat batched GEMVs + per-job eager cores. The batched path is
@@ -1467,7 +1471,7 @@ class DSV4Attention(Module):
         for rs in rsg[1:B]:
             assert self._get_rsl(rs, layer_instance) is rsl, \
                 "batched DSA path requires all jobs in one cache"
-        m = self.compress_rate if self.compressor is not None else 1
+        m = self.compress_rate if self.kv_source is not None else 1
         w = self.sliding_window
         kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
 
@@ -1495,6 +1499,65 @@ class DSV4Attention(Module):
             beg_l.append(rs.window_beg + shift)
             ec_l.append(ec)
             slot_l.append(slot)
+
+        # DeepSeek-V4.1 (q_head_norm=False): the upstream batched body below is written for
+        # V4's per-head q norm and its self.indexer compressor, so it cannot serve V4.1's
+        # shared pools / idx_wk indexer keys. Instead run ONE batched projection pass over
+        # every row (q_a/wkv/q_b/comp/idx fans, rope, q_norm) and hand each job's slice to
+        # the correct per-job attention core: the projections are the dominant per-job cost
+        # (q_b 1280->32768, wo_b, wo_a), so batching them is what makes concurrency pay.
+        if not self.q_head_norm and os.environ.get("EXL3_DSV4_BATCH_PRE", "1") != "0":
+            a_pos = torch.tensor(pos_l, dtype = torch.int32, device = device)
+            _t0 = time.perf_counter() if _prof else 0.0
+            pre_all = self._project_batch(x, params, None, a_pos = a_pos)
+            if _prof:
+                _prof_acc["proj"] += time.perf_counter() - _t0
+            _t1 = time.perf_counter() if _prof else 0.0
+            if os.environ.get("EXL3_DSV4_BATCH_ATTN", "1") != "0":
+                y = self._forward_cached_batch_v41(
+                    x, params, rsg, rsl, layer_instance, out_dtype, kl, bt,
+                    pos_l, beg_l, slot_l, pre_all, S, B)
+            else:
+                # per-job cores; the prepass already shifted the rings, so tell each core
+                q_res, q, kv, ckv, cg, ikv, ig, qidx = pre_all
+
+                def _rows(t, i):
+                    if t is None:
+                        return None
+                    if t.dim() == 3 and t.shape[0] == 1:
+                        t = t[0]
+                    return t[i * S:(i + 1) * S]
+
+                outs = []
+                for i in range(B):
+                    pre = {
+                        "q_res": _rows(q_res, i),
+                        "q": q[i:i + 1],
+                        "kv": kv[i:i + 1].view(1, S, self.head_dim),
+                        "comp_kv": _rows(ckv, i),
+                        "comp_gate": _rows(cg, i),
+                        "idx_kv": _rows(ikv, i),
+                        "idx_gate": _rows(ig, i),
+                        "q_idx": _rows(qidx, i),
+                    }
+                    outs.append(self._forward_cached_one(
+                        x[i:i + 1], params, rsg[i], rsl, out_dtype, copy_static = True,
+                        pre = pre, kl = kl, bt_row = bt[i:i + 1] if bt is not None else None,
+                        ring_shift = beg_l[i] - rsg[i].window_beg))
+                y = torch.cat(outs, dim = 0)
+            if _prof:
+                _prof_acc["jobs"] += time.perf_counter() - _t1
+                _prof_acc["n"] += 1
+                if _prof_acc["n"] % 200 == 0:
+                    n = _prof_acc["n"]
+                    print(f" -- dsv4 prof (L{self.layer_idx}, B={B}, S={S}): "
+                          f"proj {_prof_acc['proj']/n*1e3:.2f} ms, "
+                          f"step {_prof_acc['jobs']/n*1e3:.2f} ms "
+                          f"({_prof_acc['jobs']/n/B*1e3:.2f} ms/job)", flush = True)
+                    for k in ("proj", "jobs", "comp", "idx", "attn", "o"):
+                        _prof_acc[k] = 0.0
+                    _prof_acc["n"] = 0
+            return y
 
         # Whole-batch BC graph (house pattern): all per-job state device-driven through the
         # owner's (6, MAX_B) array and block-table static, the input pointer is the only
@@ -1675,11 +1738,7 @@ class DSV4Attention(Module):
 
         if self.x_fan is not None and rows <= 32:
             f = self.x_fan
-            shapes = [(self.q_a.out_features,), (self.head_dim,)]
-            if self.compressor is not None:
-                shapes += [(self.compressor.wkv.out_features,)] * 2
-            if self.indexer is not None:
-                shapes += [(self.indexer.wkv.out_features,)] * 2
+            shapes = [(n,) for n in f["ns"]]
             fouts, cptr, ahad = self._fan_outs(f, "x", rows, shapes)
             ext.exl3_mgemm(
                 xf, f["trellis"], fouts[0].view(1, rows, -1), f["suh"], ahad, f["svh"],
@@ -1693,9 +1752,11 @@ class DSV4Attention(Module):
             q_res = q_res.view(1, rows, -1)
             kv = fouts[1]
             if self.compressor is not None:
-                comp_kv, comp_gate = fouts[2], fouts[3]
+                comp_kv = fouts[2]
+                comp_gate = fouts[3] if self.compressor.wgate is not None else comp_kv
             if self.indexer is not None:
-                idx_kv, idx_gate = fouts[4], fouts[5]
+                i_off = 4 if (self.compressor is not None and self.compressor.wgate is not None) else 3
+                idx_kv, idx_gate = fouts[i_off], fouts[i_off + 1]
         else:
             q_res = self.q_norm.forward(self.q_a.forward(xf, params), params, out_dtype = torch.half)
             kv = self.wkv.forward(xf, params)[0]
@@ -1703,7 +1764,8 @@ class DSV4Attention(Module):
                 if not self.compressor.fused_ready:
                     self.compressor._build_fused()
                 comp_kv = self.compressor.wkv.forward(xf, params)[0]
-                comp_gate = self.compressor.wgate.forward(xf, params)[0]
+                comp_gate = self.compressor.wgate.forward(xf, params)[0] \
+                    if self.compressor.wgate is not None else comp_kv
             if self.indexer is not None:
                 if not self.indexer.fused_ready:
                     self.indexer._build_fused()
@@ -1738,15 +1800,136 @@ class DSV4Attention(Module):
         positions = a_pos if a_pos is not None else \
             torch.tensor([rs.position for rs in rsg[:B]], dtype = torch.int32,
                          device = x.device)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), 0, positions, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1,
-            self.head_dim - self.rope_head_dim,
-        )
+        if not self.q_head_norm:
+            _ext_rope(q[..., -self.rope_head_dim:], self._rope_type(), 0, positions = positions)
+            ext.rope(
+                kv, kv, None, None,
+                self._rope_type(), 0, positions, None,
+                int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
+                self.rms_norm_eps, 0.0, 0.0, 0, 1,
+                self.head_dim - self.rope_head_dim,
+            )
+        else:
+            ext.rope(
+                q, q, kv, kv,
+                self._rope_type(), 0, positions, None,
+                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
+                self.rms_norm_eps, 0.0, 0.0, 0, 1,
+                self.head_dim - self.rope_head_dim,
+            )
         return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
 
+
+    def _ring_update(self, rs, rsl, kv, pos0, seq, w, ring_beg, shift = 0):
+        """Append this chunk's roped K=V rows to the slot's sliding ring.
+
+        shift > 0 means the caller's prepass already moved the ring left by that many rows
+        (and set rs.wshift), so the rows for pos0 sit at offset - shift and the chunk is
+        guaranteed to fit. Otherwise the shift/rebase branches run here, after attention
+        (the kernel addresses the PRE-update ring via ring_beg)."""
+        ring = rsl.ring[rs.slot]
+        offset = pos0 - rs.window_beg - shift
+        pos_end = pos0 + seq
+        if shift or offset + seq <= rsl.ring_rows:
+            ring[offset : offset + seq].copy_(kv)
+            return
+        if seq < PAGE_SIZE:
+            need = offset + seq - rsl.ring_rows
+            sh = -(-need // PAGE_SIZE) * PAGE_SIZE
+            ring[:rsl.ring_rows - sh].copy_(ring[sh:].clone())
+            rs.wshift = sh
+            ring[offset - sh : offset - sh + seq].copy_(kv)
+            return
+        new_beg = max(pos_end - (w - 1), 0) // PAGE_SIZE * PAGE_SIZE
+        n_keep = pos_end - new_beg
+        n_from_kv = min(n_keep, seq)
+        n_from_ring = n_keep - n_from_kv          # rows below pos0 still needed
+        assert 0 < n_keep <= rsl.ring_rows
+        if n_from_ring > 0:
+            src0 = pos0 - n_from_ring - ring_beg
+            ring[:n_from_ring].copy_(ring[src0 : src0 + n_from_ring].clone())
+        ring[n_from_ring : n_keep].copy_(kv[seq - n_from_kv:])
+        rs.wshift = new_beg - rs.window_beg
+
+    def _forward_cached_batch_v41(self, x, params, rsg, rsl, layer_instance, out_dtype,
+                                  kl, bt, pos_l, beg_l, slot_l, pre_all, S, B):
+        """DeepSeek-V4.1 batched step: ONE multirow dsa_attn and ONE grouped o_proj over all
+        jobs, with the compressor/indexer prep still per job (it carries the V4.1 shared-pool,
+        idx_wk key writing and candidate-mask logic, which the upstream batched body does not
+        implement). The per-job prep is cheap; the attention launch and the o_proj are the
+        expensive per-job calls (Triton launch ~0.13 ms, o_proj ~0.09 ms), so batching those
+        is what makes concurrency pay."""
+        device = x.device
+        R = B * S
+        q_res, q, kv, ckv, cg, ikv, ig, qidx = pre_all
+
+        def _rows(t, i):
+            if t is None:
+                return None
+            if t.dim() == 3 and t.shape[0] == 1:
+                t = t[0]
+            return t[i * S:(i + 1) * S]
+
+        preps = []
+        for i in range(B):
+            pre = {
+                "q_res": _rows(q_res, i),
+                "q": q[i:i + 1],
+                "kv": kv[i:i + 1].view(1, S, self.head_dim),
+                "comp_kv": _rows(ckv, i),
+                "comp_gate": _rows(cg, i),
+                "idx_kv": _rows(ikv, i),
+                "idx_gate": _rows(ig, i),
+                "q_idx": _rows(qidx, i),
+            }
+            preps.append(self._forward_cached_one(
+                x[i:i + 1], params, rsg[i], rsl, out_dtype, copy_static = True, pre = pre,
+                kl = kl, bt_row = bt[i:i + 1] if bt is not None else None,
+                prep_only = True, ring_shift = beg_l[i] - rsg[i].window_beg))
+
+        qs = torch.cat([p["q"] for p in preps], dim = 0)                 # (R, H, D)
+        kvs = torch.cat([p["kv"] for p in preps], dim = 0)               # (R, D)
+
+        idxs = None
+        if preps[0]["indices"] is not None:
+            kmax = max(p["indices"].shape[1] for p in preps)
+            idxs = torch.full((R, kmax), -1, dtype = torch.int32, device = device)
+            for i, p in enumerate(preps):
+                w_ = p["indices"].shape[1]
+                idxs[i * S:(i + 1) * S, :w_] = p["indices"]
+
+        i32 = lambda vals: torch.tensor(vals, dtype = torch.int32, device = device)
+        hpg = self.num_q_heads // self.o_groups
+        # sliding layers have no pool (kv_source is None) and no block table of their own
+        bt_attn = bt if bt is not None else preps[0]["bt"]
+        out = dsa_attn(
+            qs.half().contiguous(), preps[0]["pool_c"], preps[0]["pool_r"], bt_attn,
+            sinks = self.sinks,
+            ring = rsl.ring, kv_chunk = kvs,
+            win_len = self.sliding_window, indices = idxs,
+            compress_rate = preps[0]["dense_m"], scale = self.sm_scale,
+            derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
+            page_size = preps[0]["epp"], qc = preps[0]["qc"],
+            out = g_tensor_cache.get(device, (self.o_groups, R, hpg * self.head_dim),
+                                     torch.half, "dsv4_b_out"),
+            multirow = dict(
+                q_pos = i32(pos_l),
+                win_floor = i32([p["win_floor"] for p in preps]),
+                ring_beg = i32([p["ring_beg"] for p in preps]),
+                pool_len = i32([p["pool_len"] for p in preps]),
+                k_len = i32([p["k_len"] for p in preps]),
+                slot_ids = i32(slot_l),
+                ring_stride = rsl.ring_rows * self.head_dim, seq = S,
+            ),
+        )
+
+        for i, p in enumerate(preps):
+            self._ring_update(rsg[i], rsl, kvs[i * S:(i + 1) * S], pos_l[i], S,
+                              self.sliding_window, p["ring_beg"],
+                              shift = beg_l[i] - rsg[i].window_beg)
+
+        return self._project_o_grouped(out.unsqueeze(1), params, out_dtype,
+                                       mgemm_out = (R <= 32)).view(B, S, -1)
 
     def _forward_cached_one(
         self,
@@ -1760,6 +1943,8 @@ class DSV4Attention(Module):
         return_o = False,
         kl = None,
         bt_row = None,           # (1, npr) i32 device block-table row of this job
+        prep_only = False,       # stop after compressor/indexer (batched-attention caller)
+        ring_shift = 0,          # ring already shifted by the batched prepass
     ):
         _, seq, _ = x.shape
 
@@ -1872,13 +2057,14 @@ class DSV4Attention(Module):
         n_prev = min(w - 1, pos0 - rs.window_beg, pos0)
         win_floor = pos0 - n_prev
         ring = rsl.ring[slot]
-        ring_beg = rs.window_beg
+        ring_beg = rs.window_beg + ring_shift
 
         indices = None
         k_len = 0
         pool_len = 0
         dense_m = 1
         epp = 256
+        _tp = time.perf_counter() if (_prof and pre is not None) else 0.0
         if self.compressor is not None:
             m = self.compress_rate
             dense_m = m
@@ -1942,6 +2128,9 @@ class DSV4Attention(Module):
             assert kl.pool_r.device == device, "DSV4Attention: shared pool on another device"
             dense_m, epp, pool_len = self.compress_rate, kl.epp, ec
 
+        if _prof and pre is not None:
+            _prof_acc["comp"] += time.perf_counter() - _tp
+            _tp = time.perf_counter()
         if topk_regime:
             # Selection is only non-trivial once the pool exceeds index_topk: below that,
             # top-k keeps every entry under the causal bound, which is exactly DENSE_POOL
@@ -1965,6 +2154,14 @@ class DSV4Attention(Module):
             pool_r = g_tensor_cache.get(device, (1, self.rope_head_dim), torch.half, "dsv4_b_pr0")
             bt = g_tensor_cache.get(device, (1, 1), torch.int32, "dsv4_b_bt0")
 
+        if _prof and pre is not None:
+            _prof_acc["idx"] += time.perf_counter() - _tp
+            _tp = time.perf_counter()
+        if prep_only:
+            return dict(q = q[0], kv = kv[0], indices = indices, k_len = k_len,
+                        pool_len = pool_len, win_floor = win_floor, ring_beg = ring_beg,
+                        dense_m = dense_m, epp = epp, qc = qc,
+                        pool_c = pool_c, pool_r = pool_r, bt = bt, pos0 = pos0, slot = slot)
         # eq. 26 de-rotation and the group-major store for the grouped o_proj are fused into
         # the kernel epilogue: output is (G, seq, hpg * D), fp16
         hpg = self.num_q_heads // self.o_groups
@@ -1984,35 +2181,15 @@ class DSV4Attention(Module):
             nc_chunk = bool(params.get("nc_chunk", False)),
         )
 
-        # Ring update after attention: the shift/rebase branches move rows the kernel
-        # reads in place (the kernel addresses the PRE-update ring via ring_beg). Keep the
-        # trailing window resident for the next forward: in-place append while the chunk
-        # fits; SWA-style page shift for small appends near the ring end; a window rebase
-        # for chunks that overflow the ring outright. All layers compute the same wshift
-        # for the same forward, so setting it is idempotent
-        offset = pos0 - rs.window_beg
-        pos_end = pos0 + seq
-        if offset + seq <= rsl.ring_rows:
-            ring[offset : offset + seq].copy_(kv[0])
-        elif seq < PAGE_SIZE:
-            need = offset + seq - rsl.ring_rows
-            shift = -(-need // PAGE_SIZE) * PAGE_SIZE
-            ring[:rsl.ring_rows - shift].copy_(ring[shift:].clone())
-            rs.wshift = shift
-            ring[offset - shift : offset - shift + seq].copy_(kv[0])
-        else:
-            new_beg = max(pos_end - (w - 1), 0) // PAGE_SIZE * PAGE_SIZE
-            n_keep = pos_end - new_beg
-            n_from_kv = min(n_keep, seq)
-            n_from_ring = n_keep - n_from_kv          # rows below pos0 still needed
-            assert 0 < n_keep <= rsl.ring_rows
-            if n_from_ring > 0:
-                src0 = pos0 - n_from_ring - ring_beg
-                ring[:n_from_ring].copy_(ring[src0 : src0 + n_from_ring].clone())
-            ring[n_from_ring : n_keep].copy_(kv[0, seq - n_from_kv:])
-            rs.wshift = new_beg - rs.window_beg
+        if _prof and pre is not None:
+            _prof_acc["attn"] += time.perf_counter() - _tp
+            _tp = time.perf_counter()
+        self._ring_update(rs, rsl, kv[0], pos0, seq, w, ring_beg, ring_shift)
 
         if return_o:
             return out
-        return self._project_o_grouped(out.unsqueeze(1), params, out_dtype, mgemm_out = use_cached_out)
+        _r = self._project_o_grouped(out.unsqueeze(1), params, out_dtype, mgemm_out = use_cached_out)
+        if _prof and pre is not None:
+            _prof_acc["o"] += time.perf_counter() - _tp
+        return _r
 

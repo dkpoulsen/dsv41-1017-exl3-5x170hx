@@ -20,7 +20,7 @@ model:
   backend: exllamav3
   max_seq_len: 1048576
   cache_size: 1048576
-  max_batch_size: 1
+  max_batch_size: 8        # up to 8 concurrent sequences (shared 1M-token pool)
   chunk_size: 4096
   gpu_split_auto: false    # limits per card, in GB; exllamav3 places layers to fit them
   gpu_split: [54, 54, 54, 54, 48]
