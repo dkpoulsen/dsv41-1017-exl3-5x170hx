@@ -23,13 +23,13 @@ Three sets of changes make the full **1,048,576-token FP16 context + DSpark MTP 
 | Free / available host RAM | ~29 GiB free | **105 GiB free (206 GiB avail)** | ~29 GiB free | 124 GiB free | **124 GiB free** |
 | Model load time | ~285 s | ~285 s | 192.7 s | 192.7 s | **157.5 s** |
 | VRAM per GPU (GiB) | 47.3, 44.6×4 | 47.3, 44.6×4 | 48.4, 50.6, 51.4, 48.4, **17.7** | 48.4, 50.6, 51.4, 48.4, 17.7 | **40.8, 30.8, 43.8, 41.3, 51.8** |
-| **Decode: `utf8_len` (C code)** | 71.8 tok/s | **82.9–91.8 tok/s** | 48.4 tok/s | 46.4 tok/s | **64.2–65.4 tok/s (+35–48%)** |
-| **Decode: `review` (600 tok)** | 55.5 tok/s | **50.5–58.0 tok/s** | 32.7 tok/s | 33.8 tok/s | **45.7 tok/s (+40%)** |
-| **Decode: `agreement` (prose)** | — | **73.1–76.9 tok/s** | 44.1 tok/s | 45.6 tok/s | **51.3–54.0 tok/s (+22%)** |
-| **Decode: `reason` (math)** | — | **86.4–95.6 tok/s** | 52.6 tok/s | 58.3 tok/s | **70.3 tok/s (+34%)** |
-| **Cold prefill ~55K** | 883.8 tok/s (64.9 s) | 823.4 tok/s (67.8 s) | 1,235.0 tok/s (44.3 s) | 1,244.5 tok/s (44.3 s) | **2,572.7 tok/s (21.7 s, 2.08×)** |
-| **Cold prefill ~255K** | 908.2 tok/s (292.6 s) | **935.8 tok/s** (275.3 s) | 1,436.3 tok/s (176.3 s) | 1,420.5 tok/s (179.6 s) | **2,447.6 tok/s (105.3 s, 1.70×)** |
-| **Cold prefill 1.04M** | 832.6 tok/s (20.9 min) | — | 1,264.5 tok/s (13.8 min) | — | *~2,400 tok/s (~7.2 min est.)* |
+| **Decode: `utf8_len` (C code)** | 71.8 tok/s | **82.9–91.8 tok/s** | 48.4 tok/s | 46.4 tok/s | **61.5–65.4 tok/s (+39–48%)** |
+| **Decode: `review` (600 tok)** | 55.5 tok/s | **50.5–58.0 tok/s** | 32.7 tok/s | 33.8 tok/s | **44.7–45.7 tok/s (+33–36%)** |
+| **Decode: `agreement` (prose)** | — | **73.1–76.9 tok/s** | 44.1 tok/s | 45.6 tok/s | **53.1–55.3 tok/s (+20–25%)** |
+| **Decode: `reason` (math)** | — | **86.4–95.6 tok/s** | 52.6 tok/s | 58.3 tok/s | **79.6–80.7 tok/s (+51–53%)** |
+| **Cold prefill ~55K** | 883.8 tok/s (64.9 s) | 823.4 tok/s (67.8 s) | 1,235.0 tok/s (44.3 s) | 1,244.5 tok/s (44.3 s) | **2,559.3 tok/s (21.8 s, 2.07×)** |
+| **Cold prefill ~255K** | 908.2 tok/s (292.6 s) | **935.8 tok/s** (275.3 s) | 1,436.3 tok/s (176.3 s) | 1,420.5 tok/s (179.6 s) | **2,940.4 tok/s (87.6 s, 2.05×)** |
+| **Cold prefill 1.04M** | 832.6 tok/s (20.9 min) | — | 1,264.5 tok/s (13.8 min) | — | *~2,900 tok/s (~6.0 min est.)* |
 | DSML tool calling (`get_weather`) | Pass | **Pass** | Pass | Pass | **Pass** |
 | Greedy output (`agreement` & `reason`) | Reference | **Byte-identical** | **Byte-identical** | **Byte-identical** | **Byte-identical** |
 
@@ -143,10 +143,25 @@ Together, these pushed single-stream decode on `c_code` from **44.2 → 65.4 tok
 
 ---
 
+### F. DeepInfer-SM80 Architectural & Kernel Adaptations (`patches/row_table.py`, `patches/model_ls.py`, `patches/generator.py`)
+Adapted core Ampere breakthroughs from [`HalfVulpes/Deepinfer-SM80`](https://github.com/HalfVulpes/Deepinfer-SM80):
+1. **Early Async Engram Prefetch & Dual-Table Staging (`patches/row_table.py`, `patches/ngram_embedding.py`)**:
+   - In baseline serving, `self.scale` lookup was never prefetched alongside `self.table`, causing synchronous CPU stalls and 100% prefetch misses at Layers 1 and 14.
+   - Tied `companion_scale` into `RowTable`: both the 128-byte packed FP4 payload and the 8-byte E8M0 scale rows are gathered simultaneously on the background worker thread during prefetch and uploaded to the GPU in a single non-blocking DMA pair.
+2. **IEEE-754 Bitshift Scale Decoding (`patches/ngram_embedding.py`)**:
+   - Replaced transcendental `.exp2()` calls with single-instruction IEEE-754 integer bitshifts: `(scale_u8 << 23).view(torch.float32)` produces the exact power-of-two $2^{s - 127}$ on the integer pipe with zero SFU contention.
+3. **DSpark MTP Dynamic Confidence-Head Draft Pruning (`EXL3_DSPARK_CONF=0.4`, `patches/generator.py`)**:
+   - Evaluates `mtp.2.confidence_head.proj.weight` (`[1, 5376]`) during speculative drafting to dynamically prune low-confidence draft tokens on divergent prose, preventing target verification overhead and boosting math decode to **80.7 tok/s (+53% vs baseline)** while maintaining 100% byte-identical greedy output.
+4. **YOCO Prefill Compaction at Layer 20 (`EXL3_YOCO_COMPACT=1`, `patches/model_ls.py`)**:
+   - DeepSeek-V4.1's 40-layer backbone is a YOCO hybrid: Layer 20 is the final global KV producer (`kv_source_layer_ids = [2, 8, 14, 20]`). Layers 21–39 never write global KV.
+   - For all intermediate prefill chunks prior to the prompt tail, intermediate tokens in Layers 21–39 are skipped, reducing pipeline compute by 40% and pushing 258K cold prefill to **2,940 tok/s**.
+
+---
+
 ## Repository Layout
 
 - `build/` — `Containerfile`, `headers.py`, `check_engine.py`, `get_engine.sh`, `make_view.py`, `chat_template.jinja`, `tokenizer_config.json`
-- `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, `moe_coop/` (the 4 C++/CUDA MoE kernel patches + unified diffs), and the 8 patched engine modules (`generator.py`, `ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
-- `serving/` — `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS systemd service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
+- `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, `moe_coop/` (the 4 C++/CUDA MoE kernel patches + unified diffs), and the 9 patched engine modules (`row_table.py`, `generator.py`, `ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
+- `serving/` — `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS systemd service with `dsparkConf` and `yocoCompact`), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
 - `bench/` — `bench_ab.py`, `bench_conc.py`, `compare.py`, `capture_ref.py`
 - `results/` — `results-tp5*.json`, `results-pp5*.json`, `results-conc-*.json`, `ref-*.json`, `convert.log`

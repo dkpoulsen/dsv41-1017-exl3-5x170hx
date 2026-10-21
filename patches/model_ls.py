@@ -445,6 +445,7 @@ class Model_LSMixin(ABC):
             return module.forward(x, p)
 
         taps_cpu = os.environ.get("EXL3_PREFILL_TAPS_CPU", "0") == "1"
+        yoco_compact = os.environ.get("EXL3_YOCO_COMPACT", "0") == "1"
 
         def emit(s, x, p):
             if s < len(qs):
@@ -452,7 +453,8 @@ class Model_LSMixin(ABC):
                 qs[s].join()
             else:
                 es = p.get("export_states") or ()
-                taps.append([t.cpu() for t in es] if taps_cpu else list(es))
+                if es:
+                    taps.append([t.cpu() for t in es] if taps_cpu else list(es))
 
         def stage(s):
             with torch.inference_mode():
@@ -460,13 +462,17 @@ class Model_LSMixin(ABC):
                     try:
                         try:
                             if not err:
-                                x = step(x, p, cuts[s])
+                                if yoco_compact and p.get("skip_post_yoco") and s >= 3:
+                                    x = None
+                                else:
+                                    x = step(x, p, cuts[s])
                         finally:
                             qs[s - 1].task_done()
-                        for i in range(cuts[s] + 1, cuts[s + 1]):
-                            if err:
-                                break
-                            x = step(x, p, i)
+                        if not (yoco_compact and p.get("skip_post_yoco") and s >= 3):
+                            for i in range(cuts[s] + 1, cuts[s + 1]):
+                                if err:
+                                    break
+                                x = step(x, p, i)
                         if not err:
                             emit(s, x, p)
                     except BaseException as e:
@@ -478,12 +484,16 @@ class Model_LSMixin(ABC):
         try:
             for t in threads:
                 t.start()
-            for c, ids in enumerate(input_ids.split(n, dim = -1)):
+            chunks = list(input_ids.split(n, dim = -1))
+            num_chunks = len(chunks)
+            for c, ids in enumerate(chunks):
                 if err:
                     break
                 for h in getattr(self.config, "moe_cpu_hosts", {}).values():
                     h.begin_pass()
                 p = dict(params, cache_seqlens = params["cache_seqlens"] + c * n)
+                if yoco_compact and c < num_chunks - 1:
+                    p["skip_post_yoco"] = True
                 x = self.prepare_inputs(ids, p)
                 for m in self._get_prefetch_layers:
                     m.prefetch(x, p)
@@ -513,7 +523,7 @@ class Model_LSMixin(ABC):
                 raise err[0]
             finally:
                 err.clear()
-        if taps[0]:
+        if taps and taps[0]:
             params["export_states"] = [torch.cat(t, dim = -2) for t in zip(*taps)]
         return True
 

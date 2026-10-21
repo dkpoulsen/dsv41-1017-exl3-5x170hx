@@ -24,7 +24,9 @@ def _get_fp4_luts(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         v_lo = mag[lo & 7] * torch.where((lo >> 3) == 1, -1.0, 1.0)
         v_hi = mag[hi & 7] * torch.where((hi >> 3) == 1, -1.0, 1.0)
         byte_lut = torch.stack((v_lo, v_hi), dim = 1).contiguous().to(dev)
-        scale_lut = (torch.arange(256, dtype = torch.float32, device = dev) - 127.0).exp2().contiguous()
+        # IEEE-754 bitshift scale decoding: (scale << 23).view(float32) == 2.0 ** (scale - 127.0)
+        scale_lut = (torch.arange(256, dtype = torch.int32, device = dev) << 23).view(torch.float32).contiguous()
+        scale_lut[0] = 0.0
         luts = (byte_lut, scale_lut)
         _FP4_DEV_LUTS[dev] = luts
     return luts
@@ -207,6 +209,7 @@ class NGramEmbedding(Module):
                 f"{self.key}: packed e2m1 payload (uint8) requires the .scale table beside it"
             assert table.row_words == self.head_dim // 2, \
                 f"{self.key}: expected head_dim//2 = {self.head_dim // 2} bytes per packed row, got {table.row_words}"
+            self.table.companion_scale = self.scale
         else:
             assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
         assert not quantized or self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
@@ -299,13 +302,18 @@ class NGramEmbedding(Module):
             module.codebook = mul1_codebook(device)
         return module
 
-    def _decode_fp4(self, packed: torch.Tensor, uids: torch.Tensor, U: int) -> torch.Tensor:
+    def _decode_fp4(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
         """packed: (U, head_dim // 2) uint8 rows on the device -> (U, head_dim) float rows,
         scaled per 32-value block by the rewritten e8m0 budgets (byte e + 127)."""
         dev = packed.device
         byte_lut, scale_lut = _get_fp4_luts(dev)
         rows = byte_lut[packed.long()]
-        if self.scale is not None:
+        if getattr(pin, "scale_packed", None) is not None:
+            scale_bytes = pin.scale_packed[:U].to(dev, non_blocking = True)
+            s = scale_lut[scale_bytes.long()]
+            rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
+        elif self.scale is not None:
+            uids = pin.uids if hasattr(pin, "uids") else pin
             s = self.scale.lookup(uids[:U], U, lambda ids, _: (ids, True),
                                   lambda r, *_: scale_lut[r.long()], dev)
             rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
@@ -401,7 +409,7 @@ class NGramEmbedding(Module):
 
     def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
         if self.fp4:
-            return self._decode_fp4(packed, pin.uids, U)
+            return self._decode_fp4(packed, pin, U)
         if not self.K:
             rows = packed.float()
             if self.scale is not None:

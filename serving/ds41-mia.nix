@@ -68,9 +68,12 @@ let
       -e EXL3_NGRAM_STREAM=0 \
       -e EXL3_NGRAM_LOCK=0 \
       -e EXL3_LAYERS_PER_DEVICE=${cfg.layersPerDevice} \
+      -e EXL3_DSPARK_CONF=${cfg.dsparkConf} \
+      -e EXL3_YOCO_COMPACT=${cfg.yocoCompact} \
       -e EXL3_PROF=${cfg.prof} \
       -v ${serveDir}/native-opt:/engine/native:ro \
       -v ${patchDir}/generator.py:${engineDir}/generator/generator.py:ro \
+      -v ${patchDir}/row_table.py:${engineDir}/modules/row_table.py:ro \
       -v ${patchDir}/ngram_embedding.py:${engineDir}/modules/ngram_embedding.py:ro \
       -v ${patchDir}/deepseek_v41_mod.py:${engineDir}/modules/arch_specific/deepseek_v41.py:ro \
       -v ${patchDir}/dsv4.py:${engineDir}/modules/dsv4.py:ro \
@@ -99,6 +102,18 @@ in
       type = lib.types.str;
       default = "0";
       description = "EXL3_PROF: log the batched-step projection vs per-job split (diagnostic).";
+    };
+
+    dsparkConf = lib.mkOption {
+      type = lib.types.str;
+      default = "0.4";
+      description = "EXL3_DSPARK_CONF: confidence threshold for dynamic DSpark draft pruning (DeepInfer-SM80).";
+    };
+
+    yocoCompact = lib.mkOption {
+      type = lib.types.str;
+      default = "1";
+      description = "EXL3_YOCO_COMPACT: 1 to enable YOCO prefill compaction at Layer 20 (DeepInfer-SM80).";
     };
 
     layersPerDevice = lib.mkOption {

@@ -56,8 +56,10 @@ run_podman run -d --name "$NAME" \
   -e EXL3_NGRAM_STREAM=${NGRAM_STREAM:-0} \
   -e EXL3_NGRAM_LOCK=${NGRAM_LOCK:-0} \
   -e EXL3_LAYERS_PER_DEVICE=${LAYERS_PER_DEVICE:-8,6,10,8,8} \
+  -e EXL3_DSPARK_CONF=${EXL3_DSPARK_CONF:-0.4} \
   -v /home/dkp/serve-mia/native-opt:/engine/native:ro \
   -v "$P/generator.py:$E/generator/generator.py:ro" \
+  -v "$P/row_table.py:$E/modules/row_table.py:ro" \
   -v "$P/ngram_embedding.py:$E/modules/ngram_embedding.py:ro" \
   -v "$P/deepseek_v41_mod.py:$E/modules/arch_specific/deepseek_v41.py:ro" \
   -v "$P/dsv4.py:$E/modules/dsv4.py:ro" \

@@ -1264,7 +1264,7 @@ class Generator:
             window = w_used
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
-        return self.draft_ids_pinned[:, :window]
+        return self.draft_ids_pinned[:batch_size, :window]
 
 
     def iterate_ngram_gen(self, results: list):
