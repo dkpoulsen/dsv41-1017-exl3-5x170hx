@@ -1,0 +1,31 @@
+# DS41-Flash-1017 EXL3 2.9bpw (Mia EAQ) serving image: anoane exllamav3 fork @309ef6d1
+# (native ext built for sm_80 = CMP 170HX) + anoane TabbyAPI fork @ce250ff,
+# on the vLLM day-0 image (python 3.12, torch 2.13+cu130, nvcc 13.0).
+FROM docker.io/vllm/vllm-openai:deepseekv41-flash-0909
+
+# cusparse/cublas headers the exllamav3 build needs (v150 recipe): the runtime image
+# ships the CUDA runtime, not the toolkit headers.
+COPY headers.py /build/headers.py
+RUN pip install --no-cache-dir nvidia-cusparse-cu13 nvidia-cublas-cu13 nvidia-nvjitlink-cu13 2>/dev/null || true
+RUN python3 /build/headers.py
+
+# engine deps missing from the base image
+RUN pip install --no-cache-dir ninja marisa_trie llguidance typing_extensions pyyaml rich 2>&1 | tail -2
+
+# one exllamav3 only: the fork's, via PYTHONPATH at runtime
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/exllamav3 /usr/local/lib/python3.12/dist-packages/exllamav3_ext* || true
+
+COPY engine-src /engine/src
+RUN mkdir -p /engine/native /engine/build/src && cp -a /engine/src/. /engine/build/src/ && chmod -R u+w /engine/build/src
+WORKDIR /engine/build/src
+ENV TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=32 CUDA_HOME=/usr/local/cuda
+RUN python3 setup.py build_ext --build-lib /engine/native --build-temp /engine/build/tmp 2>&1 | tail -20
+RUN ls -la /engine/native/ && sha256sum /engine/native/exllamav3_ext*.so
+
+COPY tabby /tabby
+RUN pip install --no-cache-dir /tabby 2>&1 | tail -3
+
+# import torch first: exllamav3_ext links libc10.so, resolvable only once torch is loaded
+COPY check_engine.py /build/check_engine.py
+RUN PYTHONPATH=/engine/src:/engine/native python3 /build/check_engine.py
+RUN cd /tabby && python3 -c "import main" 2>&1 | tail -1; echo TABBY-IMPORT-CHECKED

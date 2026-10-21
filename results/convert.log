@@ -1,0 +1,34 @@
+converter device: cuda:0
+output /home/dkp/models/1017-mia-2p9/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw/engram-fp4.safetensors: 97.28 GiB
+  layers.1: 4194304/384006168 rows (3s)
+  layers.1: 46137344/384006168 rows (30s)
+  layers.1: 88080384/384006168 rows (56s)
+  layers.1: 130023424/384006168 rows (82s)
+  layers.1: 171966464/384006168 rows (108s)
+  layers.1: 213909504/384006168 rows (133s)
+  layers.1: 255852544/384006168 rows (159s)
+  layers.1: 297795584/384006168 rows (184s)
+  layers.1: 339738624/384006168 rows (210s)
+  layers.1: 381681664/384006168 rows (235s)
+  layers.14: 4194304/384016682 rows (3s)
+  layers.14: 46137344/384016682 rows (28s)
+  layers.14: 88080384/384016682 rows (54s)
+  layers.14: 130023424/384016682 rows (79s)
+  layers.14: 171966464/384016682 rows (105s)
+  layers.14: 213909504/384016682 rows (135s)
+  layers.14: 255852544/384016682 rows (178s)
+  layers.14: 297795584/384016682 rows (220s)
+  layers.14: 339738624/384016682 rows (267s)
+  layers.14: 381681664/384016682 rows (307s)
+rel-L2 vs fp8 (first chunk of each table): {1: 0.12051421403884888, 14: 0.12087059020996094}
+  verify layer 1 row 0: |vb|=15.183 |v4|=14.459 rel_err=0.1124
+  verify layer 1 row 12345: |vb|=13.833 |v4|=13.281 rel_err=0.1077
+  verify layer 1 row 5000000: |vb|=14.773 |v4|=14.296 rel_err=0.1071
+  verify layer 1 row 100000000: |vb|=13.025 |v4|=12.587 rel_err=0.1161
+  verify layer 1 row 380000000: |vb|=13.037 |v4|=12.427 rel_err=0.1222
+  verify layer 14 row 0: |vb|=15.224 |v4|=14.509 rel_err=0.1193
+  verify layer 14 row 12345: |vb|=19.804 |v4|=19.030 rel_err=0.1218
+  verify layer 14 row 5000000: |vb|=16.131 |v4|=15.342 rel_err=0.1247
+  verify layer 14 row 100000000: |vb|=19.249 |v4|=18.458 rel_err=0.1142
+  verify layer 14 row 380000000: |vb|=14.685 |v4|=14.240 rel_err=0.1131
+CONVERT-DONE

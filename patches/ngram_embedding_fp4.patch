@@ -1,0 +1,147 @@
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/modules/ngram_embedding.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/ngram_embedding.py	2026-10-21 11:34:32.193422379 +0200
+@@ -7,6 +7,12 @@
+ from .row_table import RowTable, PREFETCH_MIN_TOKENS
+ from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
+ 
++# FP4 engram tables (offline-converted from the fp8 source): the payload is packed e2m1
++# nibbles stored as uint8 [rows, head_dim // 2] (low nibble = even column), and the e8m0
++# scale tensor holds a rewritten power-of-two budget per 32-value block (byte e + 127, so the
++# existing (b - 127).exp2() lookup yields 2^e directly). Detected from the payload dtype.
++_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
++
+ """
+ Hashed n-gram embedding table (Qwen3.8-Flash-Next ple_embedding and kin): maps each token position
+ to (ngram_size - 1) * heads_per_ngram hash-table rows and concatenates them into one feature vector.
+@@ -74,6 +80,7 @@
+         self.table = None
+         self.scale = None
+         self.K = None               # None for an unquantized table
++        self.fp4 = False            # packed e2m1 payload (uint8) + rewritten e8m0 budgets
+         self.num_rows = 0
+         self.head_bias = None
+         self.head_offsets = None
+@@ -165,17 +172,27 @@
+         stream_from_disk = self.stream_from_disk
+         if stream_from_disk is None:
+             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
+-        table.open(stc, stream_from_disk and not lock, allow_bf16 = not quantized,
+-                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock)
++        self._resolved_stream = stream_from_disk and not lock
++        # In TP mode load() runs on CPU solely to feed tp_export() before unload(); open handles only
++        open_stream = True if device.type == "cpu" else self._resolved_stream
++        table.open(stc, open_stream, allow_bf16 = not quantized,
++                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock and device.type != "cpu")
+         self._set_table(table, quantized)
+         if self.scale is not None:
+-            self.scale.open(stc, stream_from_disk and not lock, lock = lock)
++            self.scale.open(stc, open_stream, lock = lock and device.type != "cpu")
+ 
+     def _set_table(self, table: RowTable, quantized: bool):
+         self.table = table
+         self.num_rows = table.num_rows
+         self.K = (table.row_words - 1) * 16 // ROW_DIM if quantized else None
+-        assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
++        self.fp4 = (not quantized) and table.row_dtype == torch.uint8
++        if self.fp4:
++            assert self.scale is not None, \
++                f"{self.key}: packed e2m1 payload (uint8) requires the .scale table beside it"
++            assert table.row_words == self.head_dim // 2, \
++                f"{self.key}: expected head_dim//2 = {self.head_dim // 2} bytes per packed row, got {table.row_words}"
++        else:
++            assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
+         assert not quantized or self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
+ 
+     @override
+@@ -188,6 +205,7 @@
+         self.scale = None
+         self.device = None
+         self.K = None
++        self.fp4 = False
+         self.head_bias = None
+         self.head_offsets = None
+         self.head_vocab_sizes = None
+@@ -223,8 +241,9 @@
+                 "out_dtype": self.out_dtype,
+             },
+             "table": self.table.export(self.config.stc),
+-            # DeepSeek-V4.1: FP8 rows with an E8M0 scale table beside them, streamed the same way
++            # DeepSeek-V4.1: FP8/FP4 rows with an E8M0 scale table beside them
+             "scale": self.scale.export(self.config.stc) if self.scale is not None else None,
++            "stream_from_disk": getattr(self, "_resolved_stream", True),
+             "quantized": self.K is not None,
+             "head_offsets": producer.send(self.head_offsets),
+             "head_vocab_sizes": producer.send(self.head_vocab_sizes),
+@@ -234,13 +253,28 @@
+         }
+ 
+     @staticmethod
++    def _from_export_mmap(exported: dict) -> RowTable:
++        import numpy as np
++        table = RowTable(exported["key"], exported["keys"])
++        stores = []
++        for k, fn, off, shape, d in exported["handles"]:
++            dt = getattr(torch, d.split(".")[1])
++            np_dt = np.uint8 if dt == torch.uint8 else np.int16 if dt == torch.int16 else np.float16
++            mm = np.memmap(fn, dtype = np_dt, mode = "c", offset = off, shape = tuple(shape))
++            stores.append(torch.from_numpy(mm).view(dt))
++        table._set_stores(stores)
++        return table
++
++    @staticmethod
+     def tp_import(local_context, exported, plan):
+         consumer = local_context["consumer"]
+         device = local_context["device"]
+-        module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = True)
++        sfd = exported.get("stream_from_disk", True)
++        loader = RowTable.from_export if sfd else NGramEmbedding._from_export_mmap
++        module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = sfd)
+         module.device = device
+-        module._set_table(RowTable.from_export(exported["table"]), exported["quantized"])
+-        module.scale = RowTable.from_export(exported["scale"]) if exported.get("scale") is not None else None
++        module.scale = loader(exported["scale"]) if exported.get("scale") is not None else None
++        module._set_table(loader(exported["table"]), exported["quantized"])
+         module.head_offsets = consumer.recv(exported["head_offsets"], cuda = False).long().contiguous()
+         module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"], cuda = False).long().contiguous()
+         module.layer_multipliers = consumer.recv(exported["layer_multipliers"], cuda = False).long().contiguous()
+@@ -249,6 +283,22 @@
+             module.codebook = mul1_codebook(device)
+         return module
+ 
++    def _decode_fp4(self, packed: torch.Tensor, uids: torch.Tensor, U: int) -> torch.Tensor:
++        """packed: (U, head_dim // 2) uint8 rows on the device -> (U, head_dim) float rows,
++        scaled per 32-value block by the rewritten e8m0 budgets (byte e + 127)."""
++        dev = packed.device
++        codes = torch.empty((U, packed.shape[1] * 2), dtype = packed.dtype, device = dev)
++        codes[:, 0::2] = packed & 0x0F
++        codes[:, 1::2] = packed >> 4
++        lut = torch.tensor(_E2M1_LUT, device = dev)[(codes & 7).long()]
++        sgn = torch.where((codes >> 3) & 1 == 1, -1.0, 1.0)
++        rows = lut * sgn
++        if self.scale is not None:
++            s = self.scale.lookup(uids[:U], U, lambda ids, _: (ids, True),
++                                  lambda r, *_: (r.float() - 127.0).exp2(), dev)
++            rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
++        return rows
++
+     def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
+         """Unique row indices (any device) -> decoded (N, 160) rows on the module's device.
+         Reference form of the row pipeline (torch codec); forward() runs the fast path."""
+@@ -258,6 +308,8 @@
+                                         uids.to(self.device, torch.int64),
+                                         right = True) - 1).clamp(0, self.num_heads - 1)
+             rows = dequant_rows(raw, self.K, self.codebook, self.head_bias.float()[heads])
++        elif self.fp4:
++            rows = self._decode_fp4(raw, uids.to("cpu", torch.int64), raw.shape[0])
+         else:
+             rows = raw.float()
+         return rows.to(out_dtype)
+@@ -334,6 +386,8 @@
+         return pin.uids[:U], False
+ 
+     def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
++        if self.fp4:
++            return self._decode_fp4(packed, pin.uids, U)
+         if not self.K:
+             rows = packed.float()
+             if self.scale is not None:

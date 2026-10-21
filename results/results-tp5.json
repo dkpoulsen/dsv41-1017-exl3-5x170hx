@@ -1,0 +1,65 @@
+{
+  "layout": "tp5",
+  "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+  "sizes": [
+    1048576
+  ],
+  "tests": {
+    "smoke": {
+      "answer": "We need answer one word. Capital France = Paris. Must answer one word.Paris",
+      "ok": true
+    },
+    "tool_call": {
+      "ok": true,
+      "n_tool_calls": 1,
+      "first": "{\"id\": \"call_2cd80f896a0945e3ae92d23a\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}, \"type\": \"function\", \"index\": 0}"
+    },
+    "decode": [
+      {
+        "tag": "utf8_len",
+        "ttft": 0.39,
+        "decode_tok_s": 71.8,
+        "prompt_tokens": 70,
+        "completion_tokens": 377,
+        "chars": 1490
+      },
+      {
+        "tag": "review",
+        "ttft": 0.41,
+        "decode_tok_s": 55.5,
+        "prompt_tokens": 89,
+        "completion_tokens": 600,
+        "chars": 2303
+      }
+    ],
+    "prefill": [
+      {
+        "target_tokens": 57359,
+        "prompt_tokens": 57359,
+        "ttft": 64.9,
+        "prefill_tok_s": 883.8
+      },
+      {
+        "target_tokens": 265767,
+        "prompt_tokens": 265767,
+        "ttft": 292.6,
+        "prefill_tok_s": 908.2
+      },
+      {
+        "target_tokens": 537140,
+        "prompt_tokens": 537140,
+        "ttft": 612.6,
+        "prefill_tok_s": 876.9
+      },
+      {
+        "target_tokens": 1048576,
+        "prompt_tokens": 1043858,
+        "ttft": 1253.8,
+        "prefill_tok_s": 832.6
+      }
+    ],
+    "agreement": {
+      "text": "We need answer exactly two sentences. Explain hash table and average lookup cost. Need concise. Two sentences. Mention key-value mapping via hash function to buckets, average O(1) assuming good hash/load factor. Exactly two sentences. Ensure no extra.A hash table is a data structure that maps keys to values"
+    }
+  }
+}

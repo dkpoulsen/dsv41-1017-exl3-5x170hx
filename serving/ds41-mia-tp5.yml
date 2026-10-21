@@ -1,0 +1,42 @@
+# TabbyAPI config: layout TP5 — Mia-AiLab EAQ-v1 2.9bpw EXL3 of DeepSeek-V4.1-Flash-1017,
+# tensor parallel over the five CMP 170HX (native backend, reduces through host memory),
+# MTP draft head on card 0, 1M-token FP16 cache, one slot.
+# Card budget check (GiB): TP weights 189.4 + KV(1M) ~60 = 249.4 split by gpu_split;
+# card0 = 249.4*53/261 + 6.8 (MTP) = 57.4 <= 58; others = 49.7.
+network:
+  host: 127.0.0.1          # local only
+  port: 1920
+  disable_auth: true       # local bench; the repo serves with auth + a proxy
+  disable_fetch_requests: true
+  send_tracebacks: false
+  api_servers: ["OAI"]
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+model:
+  model_dir: /home/dkp/models/1017-mia-2p9
+  model_name: DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw
+  backend: exllamav3
+  max_seq_len: 1048576
+  cache_size: 1048576
+  max_batch_size: 1        # one recurrent slot; concurrent requests queue
+  chunk_size: 4096         # load chunk; the Generator's chunk is 16384 (TABBY_EXL3_GENERATOR_CHUNK)
+  gpu_split_auto: false
+  gpu_split: [45, 55, 55, 55, 55]
+  tensor_parallel: true
+  tensor_parallel_backend: native
+  reasoning: true
+  tool_format: deepseek_v41  # V4.1 DSML spelling (the fork's tool format)
+  start_in_reasoning: always
+  template_vars_default:
+    enable_thinking: true
+    reasoning_effort: high
+memory:
+  sysmem_recurrent_cache: 4096
+  sysmem_kv_cache: 0
+  cuda_malloc_async: true
+draft_model:
+  draft_mode: mtp          # the model's own draft head (DSpark, EXL3 4/6bpw in this pack)
+  draft_gpu_split: [12, 0, 0, 0, 0]   # MTP 6.75 GiB + its 1M-token cache ~1.7-4 GiB
+  dynamic_draft: true      # draft length adapts to the acceptance

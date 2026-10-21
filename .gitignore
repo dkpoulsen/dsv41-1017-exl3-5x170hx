@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.safetensors
+*.tmp
+corpus.c
+autotune-*/
