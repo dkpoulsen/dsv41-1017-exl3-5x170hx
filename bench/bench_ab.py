@@ -168,7 +168,7 @@ def main():
     # 4. prefill at several sizes
     pre = []
     for ntok in sizes:
-        prompt = prompt_of_tokens(ntok, f"{layout}-{ntok}")
+        prompt = prompt_of_tokens(ntok, f"{layout}-{ntok}-{int(time.time())}")
         try:
             t0, first, t1, text, usage, _ = http(
                 {"model": MODEL, "messages": [{"role": "user", "content": prompt}],

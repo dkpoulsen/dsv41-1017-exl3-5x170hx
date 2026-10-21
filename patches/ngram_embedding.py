@@ -12,6 +12,22 @@ from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, wo
 # scale tensor holds a rewritten power-of-two budget per 32-value block (byte e + 127, so the
 # existing (b - 127).exp2() lookup yields 2^e directly). Detected from the payload dtype.
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+_FP4_DEV_LUTS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_fp4_luts(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    luts = _FP4_DEV_LUTS.get(dev)
+    if luts is None:
+        b = torch.arange(256, dtype = torch.long)
+        lo, hi = b & 0x0F, b >> 4
+        mag = torch.tensor(_E2M1_LUT, dtype = torch.float32)
+        v_lo = mag[lo & 7] * torch.where((lo >> 3) == 1, -1.0, 1.0)
+        v_hi = mag[hi & 7] * torch.where((hi >> 3) == 1, -1.0, 1.0)
+        byte_lut = torch.stack((v_lo, v_hi), dim = 1).contiguous().to(dev)
+        scale_lut = (torch.arange(256, dtype = torch.float32, device = dev) - 127.0).exp2().contiguous()
+        luts = (byte_lut, scale_lut)
+        _FP4_DEV_LUTS[dev] = luts
+    return luts
 
 """
 Hashed n-gram embedding table (Qwen3.8-Flash-Next ple_embedding and kin): maps each token position
@@ -287,16 +303,14 @@ class NGramEmbedding(Module):
         """packed: (U, head_dim // 2) uint8 rows on the device -> (U, head_dim) float rows,
         scaled per 32-value block by the rewritten e8m0 budgets (byte e + 127)."""
         dev = packed.device
-        codes = torch.empty((U, packed.shape[1] * 2), dtype = packed.dtype, device = dev)
-        codes[:, 0::2] = packed & 0x0F
-        codes[:, 1::2] = packed >> 4
-        lut = torch.tensor(_E2M1_LUT, device = dev)[(codes & 7).long()]
-        sgn = torch.where((codes >> 3) & 1 == 1, -1.0, 1.0)
-        rows = lut * sgn
+        byte_lut, scale_lut = _get_fp4_luts(dev)
+        rows = byte_lut[packed.long()]
         if self.scale is not None:
             s = self.scale.lookup(uids[:U], U, lambda ids, _: (ids, True),
-                                  lambda r, *_: (r.float() - 127.0).exp2(), dev)
+                                  lambda r, *_: scale_lut[r.long()], dev)
             rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
+        else:
+            rows = rows.view(U, -1)
         return rows
 
     def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
@@ -407,8 +421,10 @@ class NGramEmbedding(Module):
         """
         if self.table is None or history.dim() != 2:
             return
+        import os
+        min_tok = int(os.environ.get("EXL3_NGRAM_PREFETCH_MIN", "1"))
         n = history.shape[0] * (history.shape[1] - self.context_len)
-        if n >= PREFETCH_MIN_TOKENS:
+        if n >= min_tok:
             self.table.prefetch(history, n * self.num_heads, self._resolve)
 
     @override

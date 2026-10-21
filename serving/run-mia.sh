@@ -1,25 +1,41 @@
-#!/usr/bin/env bash
-# Launch the Mia 2.9 EXL3 model in one layout, in a container, on all five CMP 170HX.
-#   run-mia.sh <tp5|pp5> [stop]
-# Stops any running ds41-mia container first. Logs: podman logs -f ds41-mia
+#!/bin/bash
+# Start DeepSeek-V4.1-Flash-1017 Mia 2.9bpw EXL3 on RAM-Monster (5x CMP 170HX).
+# Usage: run-mia.sh <tp5|pp5>
 set -euo pipefail
-L="${1:?usage: run-mia.sh <tp5|pp5> [stop]}"
-if [[ "${2:-}" == "stop" || -n "${2:-}" ]]; then :; fi
-case "$L" in tp5|pp5) ;; *) echo "layout must be tp5 or pp5" >&2; exit 2;; esac
 
-pod() { sudo -u dkp env HOME=/home/dkp XDG_RUNTIME_DIR=/run/user/1002 USER=dkp \
-        PATH=/run/wrappers/bin:/run/current-system/sw/bin "$@"; }
+LAYOUT=${1:-}
+if [[ "$LAYOUT" != "tp5" && "$LAYOUT" != "pp5" ]]; then
+  echo "Usage: $0 <tp5|pp5>" >&2
+  exit 1
+fi
 
-pod podman stop --ignore -t 30 ds41-mia >/dev/null 2>&1 || true
-pod podman rm -f --ignore ds41-mia >/dev/null 2>&1 || true
-mkdir -p /home/dkp/serve-mia/autotune-$L
+HERE=/home/dkp/serve-mia
+CFG="$HERE/ds41-mia-${LAYOUT}.yml"
+TUNE="$HERE/autotune-${LAYOUT}"
+P="$HERE/engine-patch"
+E=/engine/src/exllamav3
+DEF_CHUNK=$([[ "$LAYOUT" == "pp5" ]] && echo 65536 || echo 16384)
+mkdir -p "$TUNE"
+chown -R dkp:users "$TUNE"
 
-pod podman run -d --replace \
-  --name ds41-mia \
+run_podman() {
+  sudo -u dkp env HOME=/home/dkp XDG_RUNTIME_DIR=/run/user/1002 PATH=/run/wrappers/bin:/run/current-system/sw/bin podman "$@"
+}
+
+for c in ds41-mia-tp5 ds41-mia-pp5 ds41-mia-fg; do
+  run_podman rm -f "$c" >/dev/null 2>&1 || true
+done
+sleep 2
+
+NAME="ds41-mia-${LAYOUT}"
+echo "Starting $NAME with $CFG ..."
+run_podman run -d --name "$NAME" \
   --device nvidia.com/gpu=all \
-  --network=host --ipc=host \
+  --network=host \
+  --ipc=host \
   --cap-add IPC_LOCK \
-  --ulimit memlock=-1:-1 --ulimit nofile=65536:65536 \
+  --ulimit memlock=-1:-1 \
+  --ulimit nofile=65536:65536 \
   -w /tabby \
   --entrypoint python3 \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -30,31 +46,25 @@ pod podman run -d --replace \
   -e TOKENIZERS_PARALLELISM=false \
   -e PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync \
   -e PYTHONUNBUFFERED=1 \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
-  -e TABBY_EXL3_GENERATOR_CHUNK=16384 \
+  -e TABBY_EXL3_GENERATOR_CHUNK=${GEN_CHUNK:-$DEF_CHUNK} \
   -e EXLLAMAV3_TUNE_CACHE=/autotune \
-  -e EXLLAMA_NO_P2P_COPY=1 \
+  -e EXLLAMA_NO_P2P_COPY=${NO_P2P_COPY:-0} \
   -e EXL3_DSA_INDEXER_DTYPE=sm_80:int8 \
   -e EXL3_INT8_GEMV=0 \
   -e EXL3_NGRAM_STREAM=${NGRAM_STREAM:-0} \
   -e EXL3_NGRAM_LOCK=${NGRAM_LOCK:-0} \
-  -v /home/dkp/serve-mia/engine-patch/ngram_embedding.py:/engine/src/exllamav3/modules/ngram_embedding.py:ro \
+  -e EXL3_LAYERS_PER_DEVICE=${LAYERS_PER_DEVICE:-8,6,10,8,8} \
+  -v "$P/ngram_embedding.py:$E/modules/ngram_embedding.py:ro" \
+  -v "$P/deepseek_v41_mod.py:$E/modules/arch_specific/deepseek_v41.py:ro" \
+  -v "$P/dsv4.py:$E/modules/dsv4.py:ro" \
+  -v "$P/dspark.py:$E/modules/arch_specific/dspark.py:ro" \
+  -v "$P/dsa.py:$E/cache/dsa.py:ro" \
+  -v "$P/model_ls.py:$E/model/model_ls.py:ro" \
+  -v "$P/device_copy.py:$E/util/device_copy.py:ro" \
   -v /home/dkp/models/1017-mia-2p9:/home/dkp/models/1017-mia-2p9 \
-  -v /home/dkp/serve-mia:/serve:ro \
-  -v /home/dkp/serve-mia/autotune-$L:/autotune \
+  -v "$HERE:/serve:ro" \
+  -v "$TUNE:/autotune" \
   localhost/ds41-mia-exl3:latest \
-  /tabby/main.py --config /serve/ds41-mia-$L.yml
-
-echo "started layout $L (container ds41-mia); waiting for :1920 ..."
-for i in $(seq 1 240); do
-  if curl -s -o /dev/null http://127.0.0.1:1920/v1/models; then echo "port is up"; exit 0; fi
-  if ! pod podman ps --filter name=ds41-mia --format "{{.Names}}" 2>/dev/null | grep -q ds41-mia; then
-    echo "container exited during load; last logs:" >&2
-    pod podman logs --tail 80 ds41-mia >&2 2>&1 || true
-    exit 1
-  fi
-  sleep 10
-done
-echo "port did not come up in 40 min; last logs:" >&2
-pod podman logs --tail 80 ds41-mia >&2 2>&1 || true
-exit 1
+  /tabby/main.py --config "/serve/ds41-mia-${LAYOUT}.yml"

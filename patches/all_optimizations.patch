@@ -1,0 +1,546 @@
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/modules/ngram_embedding.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/ngram_embedding.py	2026-10-21 12:45:07.472848898 +0200
+@@ -7,6 +7,28 @@
+ from .row_table import RowTable, PREFETCH_MIN_TOKENS
+ from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
+ 
++# FP4 engram tables (offline-converted from the fp8 source): the payload is packed e2m1
++# nibbles stored as uint8 [rows, head_dim // 2] (low nibble = even column), and the e8m0
++# scale tensor holds a rewritten power-of-two budget per 32-value block (byte e + 127, so the
++# existing (b - 127).exp2() lookup yields 2^e directly). Detected from the payload dtype.
++_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
++_FP4_DEV_LUTS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
++
++
++def _get_fp4_luts(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
++    luts = _FP4_DEV_LUTS.get(dev)
++    if luts is None:
++        b = torch.arange(256, dtype = torch.long)
++        lo, hi = b & 0x0F, b >> 4
++        mag = torch.tensor(_E2M1_LUT, dtype = torch.float32)
++        v_lo = mag[lo & 7] * torch.where((lo >> 3) == 1, -1.0, 1.0)
++        v_hi = mag[hi & 7] * torch.where((hi >> 3) == 1, -1.0, 1.0)
++        byte_lut = torch.stack((v_lo, v_hi), dim = 1).contiguous().to(dev)
++        scale_lut = (torch.arange(256, dtype = torch.float32, device = dev) - 127.0).exp2().contiguous()
++        luts = (byte_lut, scale_lut)
++        _FP4_DEV_LUTS[dev] = luts
++    return luts
++
+ """
+ Hashed n-gram embedding table (Qwen3.8-Flash-Next ple_embedding and kin): maps each token position
+ to (ngram_size - 1) * heads_per_ngram hash-table rows and concatenates them into one feature vector.
+@@ -74,6 +96,7 @@
+         self.table = None
+         self.scale = None
+         self.K = None               # None for an unquantized table
++        self.fp4 = False            # packed e2m1 payload (uint8) + rewritten e8m0 budgets
+         self.num_rows = 0
+         self.head_bias = None
+         self.head_offsets = None
+@@ -165,17 +188,27 @@
+         stream_from_disk = self.stream_from_disk
+         if stream_from_disk is None:
+             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
+-        table.open(stc, stream_from_disk and not lock, allow_bf16 = not quantized,
+-                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock)
++        self._resolved_stream = stream_from_disk and not lock
++        # In TP mode load() runs on CPU solely to feed tp_export() before unload(); open handles only
++        open_stream = True if device.type == "cpu" else self._resolved_stream
++        table.open(stc, open_stream, allow_bf16 = not quantized,
++                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock and device.type != "cpu")
+         self._set_table(table, quantized)
+         if self.scale is not None:
+-            self.scale.open(stc, stream_from_disk and not lock, lock = lock)
++            self.scale.open(stc, open_stream, lock = lock and device.type != "cpu")
+ 
+     def _set_table(self, table: RowTable, quantized: bool):
+         self.table = table
+         self.num_rows = table.num_rows
+         self.K = (table.row_words - 1) * 16 // ROW_DIM if quantized else None
+-        assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
++        self.fp4 = (not quantized) and table.row_dtype == torch.uint8
++        if self.fp4:
++            assert self.scale is not None, \
++                f"{self.key}: packed e2m1 payload (uint8) requires the .scale table beside it"
++            assert table.row_words == self.head_dim // 2, \
++                f"{self.key}: expected head_dim//2 = {self.head_dim // 2} bytes per packed row, got {table.row_words}"
++        else:
++            assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
+         assert not quantized or self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
+ 
+     @override
+@@ -188,6 +221,7 @@
+         self.scale = None
+         self.device = None
+         self.K = None
++        self.fp4 = False
+         self.head_bias = None
+         self.head_offsets = None
+         self.head_vocab_sizes = None
+@@ -223,8 +257,9 @@
+                 "out_dtype": self.out_dtype,
+             },
+             "table": self.table.export(self.config.stc),
+-            # DeepSeek-V4.1: FP8 rows with an E8M0 scale table beside them, streamed the same way
++            # DeepSeek-V4.1: FP8/FP4 rows with an E8M0 scale table beside them
+             "scale": self.scale.export(self.config.stc) if self.scale is not None else None,
++            "stream_from_disk": getattr(self, "_resolved_stream", True),
+             "quantized": self.K is not None,
+             "head_offsets": producer.send(self.head_offsets),
+             "head_vocab_sizes": producer.send(self.head_vocab_sizes),
+@@ -234,13 +269,28 @@
+         }
+ 
+     @staticmethod
++    def _from_export_mmap(exported: dict) -> RowTable:
++        import numpy as np
++        table = RowTable(exported["key"], exported["keys"])
++        stores = []
++        for k, fn, off, shape, d in exported["handles"]:
++            dt = getattr(torch, d.split(".")[1])
++            np_dt = np.uint8 if dt == torch.uint8 else np.int16 if dt == torch.int16 else np.float16
++            mm = np.memmap(fn, dtype = np_dt, mode = "c", offset = off, shape = tuple(shape))
++            stores.append(torch.from_numpy(mm).view(dt))
++        table._set_stores(stores)
++        return table
++
++    @staticmethod
+     def tp_import(local_context, exported, plan):
+         consumer = local_context["consumer"]
+         device = local_context["device"]
+-        module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = True)
++        sfd = exported.get("stream_from_disk", True)
++        loader = RowTable.from_export if sfd else NGramEmbedding._from_export_mmap
++        module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = sfd)
+         module.device = device
+-        module._set_table(RowTable.from_export(exported["table"]), exported["quantized"])
+-        module.scale = RowTable.from_export(exported["scale"]) if exported.get("scale") is not None else None
++        module.scale = loader(exported["scale"]) if exported.get("scale") is not None else None
++        module._set_table(loader(exported["table"]), exported["quantized"])
+         module.head_offsets = consumer.recv(exported["head_offsets"], cuda = False).long().contiguous()
+         module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"], cuda = False).long().contiguous()
+         module.layer_multipliers = consumer.recv(exported["layer_multipliers"], cuda = False).long().contiguous()
+@@ -249,6 +299,20 @@
+             module.codebook = mul1_codebook(device)
+         return module
+ 
++    def _decode_fp4(self, packed: torch.Tensor, uids: torch.Tensor, U: int) -> torch.Tensor:
++        """packed: (U, head_dim // 2) uint8 rows on the device -> (U, head_dim) float rows,
++        scaled per 32-value block by the rewritten e8m0 budgets (byte e + 127)."""
++        dev = packed.device
++        byte_lut, scale_lut = _get_fp4_luts(dev)
++        rows = byte_lut[packed.long()]
++        if self.scale is not None:
++            s = self.scale.lookup(uids[:U], U, lambda ids, _: (ids, True),
++                                  lambda r, *_: scale_lut[r.long()], dev)
++            rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
++        else:
++            rows = rows.view(U, -1)
++        return rows
++
+     def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
+         """Unique row indices (any device) -> decoded (N, 160) rows on the module's device.
+         Reference form of the row pipeline (torch codec); forward() runs the fast path."""
+@@ -258,6 +322,8 @@
+                                         uids.to(self.device, torch.int64),
+                                         right = True) - 1).clamp(0, self.num_heads - 1)
+             rows = dequant_rows(raw, self.K, self.codebook, self.head_bias.float()[heads])
++        elif self.fp4:
++            rows = self._decode_fp4(raw, uids.to("cpu", torch.int64), raw.shape[0])
+         else:
+             rows = raw.float()
+         return rows.to(out_dtype)
+@@ -334,6 +400,8 @@
+         return pin.uids[:U], False
+ 
+     def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
++        if self.fp4:
++            return self._decode_fp4(packed, pin.uids, U)
+         if not self.K:
+             rows = packed.float()
+             if self.scale is not None:
+@@ -353,8 +421,10 @@
+         """
+         if self.table is None or history.dim() != 2:
+             return
++        import os
++        min_tok = int(os.environ.get("EXL3_NGRAM_PREFETCH_MIN", "1"))
+         n = history.shape[0] * (history.shape[1] - self.context_len)
+-        if n >= PREFETCH_MIN_TOKENS:
++        if n >= min_tok:
+             self.table.prefetch(history, n * self.num_heads, self._resolve)
+ 
+     @override
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/modules/arch_specific/deepseek_v41.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/deepseek_v41_mod.py	2026-10-21 12:44:24.923634531 +0200
+@@ -119,7 +119,7 @@
+ 
+         assert layer_idx < 0
+         self.layer_idx = layer_idx
+-        self.caps.update({"recurrent_cache": True})
++        self.caps.update({"recurrent_cache": True, "prefetch_ids": True})
+         self.layer_state_cls = EngramLayerState
+         self.recurrent_layers = []
+         self.tp_mode = False
+@@ -169,6 +169,28 @@
+             module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
+         return module
+ 
++    def prefetch(self, x: torch.Tensor, params: dict):
++        if params.get("autosplit_measure") or "input_ids" not in params:
++            return
++        ids = params["input_ids"].to("cpu", torch.long)
++        bsz, seq = ids.shape
++        ctx = self.embed.context_len
++        mm = ids >= FIRST_MM_EMBEDDING_INDEX if params.get("indexed_embeddings") else None
++        if mm is not None:
++            ids = ids.masked_fill(mm, self.pad_token_id)
++        ids = self.token_map[ids]
++        hist = torch.cat((ids.new_full((bsz, ctx), self.pad_id), ids), dim = 1)
++        rsg = params.get("recurrent_states")
++        if rsg:
++            ring = self.tp_recurrent_lookup[rsg[0].cache] if self.tp_mode else \
++                rsg[0].cache.get_recurrent_layer((self.layer_idx, params.get("layer_instance", 0)))
++            ring = ring.ids
++            R = ring.shape[1]
++            for i, rs in enumerate(rsg[:bsz]):
++                n = min(rs.position, ctx)
++                hist[i, ctx - n:ctx] = ring[rs.slot, torch.arange(rs.position - n, rs.position) % R]
++        self.embed.prefetch(hist)
++
+     @override
+     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+         hc_flush(params)
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/modules/dsv4.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/dsv4.py	2026-10-21 13:02:45.327680750 +0200
+@@ -981,9 +981,23 @@
+         kv_norm) before rotating the trailing rope slice (rotate_offset)."""
+         bsz, seq, _ = x.shape
+         rd = self.rope_head_dim
+-        q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
+-        q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
+-        kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
++        if not self.x_fan_ready and self.device is not None:
++            self._build_x_fan()
++        converting = any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
++        if bsz == 1 and seq <= 32 and self.x_fan is not None and not converting:
++            f = self.x_fan
++            fouts, cptr, ahad = self._fan_outs(f, "x", seq, [(n,) for n in f["ns"]])
++            ext.exl3_mgemm(
++                x, f["trellis"], fouts[0].view(1, seq, -1), f["suh"], ahad, f["svh"],
++                f["idx"], None, f["K"], -1, f["mcg"], f["mul1"], -1, -1, 0, 1, f["n"], cptr
++            )
++            q_res = self.q_norm.forward(fouts[0].view(1, seq, -1), params, out_dtype = torch.half)
++            kv = fouts[1].view(1, seq, 1, self.head_dim)
++            q = self.q_b.forward(q_res, params).view(1, seq, self.num_q_heads, self.head_dim)
++        else:
++            q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
++            q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
++            kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
+         if not self.q_head_norm:
+             _ext_rope(q[..., -rd:], self._rope_type(), position, positions = positions)
+             ext.rope(
+@@ -1008,7 +1022,7 @@
+         widest). Mirrors the BC_DSV4Attention fan. A second fan pairs q_b with idx_wq_b
+         (both consume q_res) for the top-k regime."""
+         self.x_fan_ready = True
+-        if not self.q_head_norm or os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
++        if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
+             return
+         device = torch.device(self.device)
+ 
+@@ -1035,23 +1049,16 @@
+         lins = [self.q_a, self.wkv]
+         if self.compressor is not None:
+             self.compressor._build_fused() if not self.compressor.fused_ready else None
+-            lins += [self.compressor.wkv, self.compressor.wgate]
++            lins += [self.compressor.wkv] + ([self.compressor.wgate] if self.compressor.wgate is not None else [])
+         if self.indexer is not None:
+             self.indexer._build_fused() if not self.indexer.fused_ready else None
+             lins += [self.indexer.wkv, self.indexer.wgate]
+         self.x_fan = mk_fan(lins)
+-        self.q_fan = mk_fan([self.q_b, self.idx_wq_b]) if self.indexer is not None else None
++        self.q_fan = mk_fan([self.q_b, self.idx_wq_b]) if self.idx_wq_b is not None else None
+         self._fan_scratch = {}
+ 
+         from .multilinear import MultiLinear
+-        try:
+-            if self.q_fan is None and self.q_b.quant_type == "exl3":
+-                self.qb_multi = MultiLinear(self.device, [self.q_b])
+-            if self.wo_b.quant_type == "exl3":
+-                self.wob_multi = MultiLinear(self.device, [self.wo_b])
+-            self._one_idx = torch.zeros((1, 1), dtype = torch.long, device = device)
+-        except AssertionError:
+-            self.qb_multi = self.wob_multi = None
++        self.qb_multi = self.wob_multi = None
+ 
+ 
+     def _mgemm1(self, mu, x2, out_dtype, tag):
+@@ -1799,11 +1806,7 @@
+             # both compressors' kv/gate); a second one pairs q_b with idx_wq_b over q_res
+             # in the top-k regime. Head norms fold into the rope kernel as in _project_qkv
+             f = self.x_fan
+-            shapes = [(self.q_a.out_features,), (self.head_dim,)]
+-            if self.compressor is not None:
+-                shapes += [(self.compressor.wkv.out_features,)] * 2
+-            if self.indexer is not None:
+-                shapes += [(self.indexer.wkv.out_features,)] * 2
++            shapes = [(n,) for n in f["ns"]]
+             fouts, cptr, ahad = self._fan_outs(f, "x", seq, shapes)
+             ext.exl3_mgemm(
+                 x,
+@@ -1840,13 +1843,23 @@
+             else:
+                 q = self.q_b.forward(q_res, params).view(1, seq, self.num_q_heads, self.head_dim)
+ 
+-            ext.rope(
+-                q, q, kv, kv,
+-                self._rope_type(), pos0, None, None,
+-                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
+-                self.rms_norm_eps, 0.0, 0.0, 0, 1,
+-                self.head_dim - self.rope_head_dim,
+-            )
++            if not self.q_head_norm:
++                _ext_rope(q[..., -self.rope_head_dim:], self._rope_type(), pos0)
++                ext.rope(
++                    kv, kv, None, None,
++                    self._rope_type(), pos0, None, None,
++                    int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
++                    self.rms_norm_eps, 0.0, 0.0, 0, 1,
++                    self.head_dim - self.rope_head_dim,
++                )
++            else:
++                ext.rope(
++                    q, q, kv, kv,
++                    self._rope_type(), pos0, None, None,
++                    int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
++                    self.rms_norm_eps, 0.0, 0.0, 0, 1,
++                    self.head_dim - self.rope_head_dim,
++                )
+             kv = kv.view(1, seq, self.head_dim)
+         else:
+             q_res, q, kv = self._project_qkv(x, params, pos0)
+@@ -1887,15 +1900,18 @@
+                 dest_a, dest_b, dbt, depp, rel = kl.pool_c.view(-1, kl.D_c), pool_r_flat, bt_row, epp, False
+             if use_fan:
+                 comp = self.compressor
++                ckv = fouts[2]
++                cgate = fouts[3] if comp.wgate is not None else ckv
+                 ext.dsv4_compress(
+-                    fouts[2], fouts[3], rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
++                    ckv, cgate, rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
+                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
+                     comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps, comp.fused_inv_freq,
+                     dest_a, dest_b, pos0, None, m, None, dbt, depp, rel)
+                 if self.layer_type == "csa":
+                     idx = self.indexer
++                    i_off = 4 if comp.wgate is not None else 3
+                     ext.dsv4_compress(
+-                        fouts[4], fouts[5], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
++                        fouts[i_off], fouts[i_off + 1], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
+                         rsl.idx_ovl[slot], idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
+                         idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, pos0,
+                         None, m, None, bt_row, epp, False)
+@@ -1945,13 +1961,16 @@
+             qc = kl.qc()
+             bt = bt_row
+         else:
+-            pool_c = x.new_empty((1, self.head_dim - self.rope_head_dim), dtype = torch.half)
+-            pool_r = x.new_empty((1, self.rope_head_dim), dtype = torch.half)
+-            bt = torch.zeros((1, 1), dtype = torch.int32, device = device)
++            pool_c = g_tensor_cache.get(device, (1, self.head_dim - self.rope_head_dim), torch.half, "dsv4_b_pc0")
++            pool_r = g_tensor_cache.get(device, (1, self.rope_head_dim), torch.half, "dsv4_b_pr0")
++            bt = g_tensor_cache.get(device, (1, 1), torch.int32, "dsv4_b_bt0")
+ 
+         # eq. 26 de-rotation and the group-major store for the grouped o_proj are fused into
+         # the kernel epilogue: output is (G, seq, hpg * D), fp16
+         hpg = self.num_q_heads // self.o_groups
++        use_cached_out = seq <= 32 and not return_o and not converting
++        out_buf = g_tensor_cache.get(device, (self.o_groups, seq, hpg * self.head_dim), torch.half, "dsv4_b_out") \
++            if use_cached_out else torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device)
+         out = dsa_attn(
+             q[0].half().contiguous(), pool_c, pool_r, bt, sinks = self.sinks,
+             ring = ring, kv_chunk = kv[0], win_len = self.sliding_window,
+@@ -1960,7 +1979,7 @@
+             compress_rate = dense_m, scale = self.sm_scale,
+             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
+             page_size = epp, qc = qc,
+-            out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
++            out = out_buf,
+             # Image chunk (vision): bidirectional over the chunk, own window into history
+             nc_chunk = bool(params.get("nc_chunk", False)),
+         )
+@@ -1995,5 +2014,5 @@
+ 
+         if return_o:
+             return out
+-        return self._project_o_grouped(out.unsqueeze(1), params, out_dtype)
++        return self._project_o_grouped(out.unsqueeze(1), params, out_dtype, mgemm_out = use_cached_out)
+ 
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/modules/arch_specific/dspark.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/dspark.py	2026-10-21 12:47:40.579641188 +0200
+@@ -8,7 +8,7 @@
+ from ...modules.dsv4 import DSV4Attention
+ from ...modules.attention_fn.dsa_triton import dsa_attn
+ from ...util.rope import RopeStyle
+-from ...util.tensor import get_for_device
++from ...util.tensor import get_for_device, g_tensor_cache
+ 
+ import os
+ dspark_fp8_kv = os.environ.get("EXL3_DSPARK_FP8KV", "0") != "0"
+@@ -80,17 +80,46 @@
+         block_table = get_for_device(params, "block_table", self.device)
+         seqlens = params["cache_seqlens"]                       # host values
+         H, D, rd = self.num_q_heads, self.head_dim, self.rope_head_dim
+-        positions = get_for_device(params, "cache_seqlens", device)
+-
+         # Projections + fused unweighted q head norm / weighted kv norm / partial rope
+-        _, q, kv = self._project_qkv(x, params, 0, positions)
++        if bsz == 1:
++            _, q, kv = self._project_qkv(x, params, int(seqlens[0]), None)
++        else:
++            positions = get_for_device(params, "cache_seqlens", device)
++            _, q, kv = self._project_qkv(x, params, 0, positions)
+         if dspark_fp8_kv:
+             fp8_fake_quant_(kv[..., : D - rd])
+ 
+         hpg = H // self.o_groups
+-        pc0 = x.new_empty((1, D - rd), dtype = torch.half)
+-        pr0 = x.new_empty((1, rd), dtype = torch.half)
++        pc0 = g_tensor_cache.get(device, (1, D - rd), torch.half, "dsv4_b_pc0")
++        pr0 = g_tensor_cache.get(device, (1, rd), torch.half, "dsv4_b_pr0")
+         main_kv = kl.kv.view(-1, D)
++        if bsz == 1:
++            p0 = int(seqlens[0])
++            hist = min(self.sliding_window, p0)
++            out_buf = g_tensor_cache.get(device, (self.o_groups, s, hpg * D), torch.half, "dsv4_b_out") \
++                if s <= 32 else torch.empty((self.o_groups, s, hpg * D), dtype = torch.half, device = device)
++            out = dsa_attn(
++                q[0].half().contiguous(),
++                pc0, pr0,
++                block_table[:1],
++                sinks = self.sinks,
++                ring = main_kv,
++                kv_chunk = kv[0].contiguous(),
++                win_len = hist + s,
++                win_floor = p0 - hist,
++                ring_beg = 0,
++                pool_len = 0,
++                q_pos0 = p0,
++                compress_rate = 1,
++                scale = self.sm_scale,
++                derot_inv_freq = self._rope_type_neg(),
++                groups = self.o_groups,
++                group_major = True,
++                page_size = 256,
++                nc_block = True,
++                out = out_buf,
++            )
++            return self._project_o_grouped(out.unsqueeze(1), params, out_dtype, mgemm_out = (s <= 32))
+         outs = []
+ 
+         # TODO: Batched DSpark-attn fwd
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/cache/dsa.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/dsa.py	2026-10-21 12:45:55.441093806 +0200
+@@ -127,14 +127,32 @@
+         mirror.alloc(device)
+         self.mirrors[device] = mirror
+ 
++    def own_tensors(self):
++        return [t for t in (self.pool_c, self.pool_q, self.pool_s, self.pool_r, self.pool_idx) if t is not None]
++
+     def pull(self, source: CacheLayer_dsa, pages, e0: int, e1: int):
+         """Copy entries [e0, e1) of one sequence from source; pages is its block table row."""
+         if e1 <= e0:
+             return
+-        for p in range(e0 // self.epp, (e1 - 1) // self.epp + 1):
+-            i, a, b = int(pages[p]), max(e0 - p * self.epp, 0), min(e1 - p * self.epp, self.epp)
+-            for dst, src in zip(self.get_tensors(), source.get_tensors()):
+-                dst[i, a:b].copy_(to_device(src[i, a:b], self.device))
++        from ..util.device_copy import needs_bounce
++        bounce = needs_bounce(torch.device(source.device), torch.device(self.device))
++        p0, p1 = e0 // self.epp, (e1 - 1) // self.epp
++        pg = pages.cpu() if pages.is_cuda else pages
++        dst_ts, src_ts = self.own_tensors(), source.own_tensors()
++        if p1 > p0:
++            plist = pg[p0 : p1 + 1].tolist()
++            if plist[-1] - plist[0] == p1 - p0 and all(plist[k + 1] - plist[k] == 1 for k in range(len(plist) - 1)):
++                r0 = plist[0] * self.epp + (e0 - p0 * self.epp)
++                r1 = plist[0] * self.epp + (e1 - p0 * self.epp)
++                for dst, src in zip(dst_ts, src_ts):
++                    d_flat, s_flat = dst.view(-1, dst.shape[-1])[r0:r1], src.view(-1, src.shape[-1])[r0:r1]
++                    d_flat.copy_(to_device(s_flat, self.device) if bounce else s_flat, non_blocking = not bounce)
++                return
++        for p in range(p0, p1 + 1):
++            i, a, b = int(pg[p]), max(e0 - p * self.epp, 0), min(e1 - p * self.epp, self.epp)
++            for dst, src in zip(dst_ts, src_ts):
++                s_sl = src[i, a:b]
++                dst[i, a:b].copy_(to_device(s_sl, self.device) if bounce else s_sl, non_blocking = not bounce)
+ 
+     def pool_c_view(self) -> torch.Tensor:
+         """Flat nope pool for the attention kernels: (rows, D_c) fp16, or the packed
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/model/model_ls.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/model_ls.py	2026-10-21 12:51:15.032793389 +0200
+@@ -98,6 +98,12 @@
+     ):
+         current_device_i = 0
+         layers_left = None
++        if layers_per_device is None and (env_lpd := os.environ.get("EXL3_LAYERS_PER_DEVICE")):
++            parsed = [int(x.strip()) for x in env_lpd.split(",") if x.strip()]
++            num_layers_chk = sum(1 for m in modules if m.layer_idx is not None and m.layer_idx >= 0)
++            if sum(parsed) == num_layers_chk:
++                layers_per_device = parsed
++                print(f" -- autosplit: using EXL3_LAYERS_PER_DEVICE={layers_per_device}", flush = True)
+         if layers_per_device is not None:
+             if not isinstance(layers_per_device, list) or \
+                     not all(isinstance(n, int) and n >= 0 for n in layers_per_device):
+@@ -346,6 +352,12 @@
+ 
+             dummy_state = None
+             unset_memory_fraction(touched_devices)
++            dev_layers = {}
++            for m in modules:
++                if m.layer_idx is not None and m.layer_idx >= 0 and m.device is not None:
++                    dev_layers.setdefault(str(m.device), []).append(m.layer_idx)
++            for d, ls in sorted(dev_layers.items()):
++                print(f" -- autosplit: {d} holds {len(ls)} layers ({ls[0]}..{ls[-1]})", flush = True)
+             if verbose:
+                 for i in touched_devices:
+                     print(f" -- autosplit: cuda:{i} largest measured transient {max_transient.get(i, 0) >> 20} MiB, "
+@@ -432,13 +444,15 @@
+             x = module.prepare_for_device(x, p)
+             return module.forward(x, p)
+ 
++        taps_cpu = os.environ.get("EXL3_PREFILL_TAPS_CPU", "0") == "1"
++
+         def emit(s, x, p):
+             if s < len(qs):
+                 qs[s].put((x, p))
+                 qs[s].join()
+             else:
+-                # Exported states leave the device with their piece
+-                taps.append([t.cpu() for t in p.get("export_states") or ()])
++                es = p.get("export_states") or ()
++                taps.append([t.cpu() for t in es] if taps_cpu else list(es))
+ 
+         def stage(s):
+             with torch.inference_mode():
+@@ -471,6 +485,8 @@
+                     h.begin_pass()
+                 p = dict(params, cache_seqlens = params["cache_seqlens"] + c * n)
+                 x = self.prepare_inputs(ids, p)
++                for m in self._get_prefetch_layers:
++                    m.prefetch(x, p)
+                 for i in range(cuts[1]):
+                     x = step(x, p, i)
+                 # Later devices run this piece with the states as its first layers left them (they set the ring
+--- /home/dkp/rnd/release/all/src-309ef6d11920/exllamav3/util/device_copy.py	2026-10-20 10:00:07.000000000 +0200
++++ /home/dkp/serve-mia/engine-patch/device_copy.py	2026-10-21 12:50:25.726524938 +0200
+@@ -83,6 +83,7 @@
+             stats["bounced"] += 1
+             return t.cpu().to(device)
+         stats["direct"] += 1
++        return t.to(device, non_blocking = True)
+     return t.to(device, non_blocking = non_blocking)
+ 
+ 

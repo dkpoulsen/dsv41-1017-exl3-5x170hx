@@ -1,0 +1,54 @@
+{
+  "layout": "pp5-opt",
+  "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+  "sizes": [
+    65536,
+    262144
+  ],
+  "tests": {
+    "smoke": {
+      "answer": "We need answer one word. Capital France = Paris. Must answer one word.Paris",
+      "ok": true
+    },
+    "tool_call": {
+      "ok": true,
+      "n_tool_calls": 1,
+      "first": "{\"id\": \"call_6034d298a8354435ba27f525\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}, \"type\": \"function\", \"index\": 0}"
+    },
+    "decode": [
+      {
+        "tag": "utf8_len",
+        "ttft": 0.61,
+        "decode_tok_s": 59.3,
+        "prompt_tokens": 70,
+        "completion_tokens": 287,
+        "chars": 1076
+      },
+      {
+        "tag": "review",
+        "ttft": 0.65,
+        "decode_tok_s": 42.2,
+        "prompt_tokens": 89,
+        "completion_tokens": 600,
+        "chars": 2292
+      }
+    ],
+    "prefill": [
+      {
+        "target_tokens": 65536,
+        "prompt_tokens": 55798,
+        "ttft": 21.7,
+        "prefill_tok_s": 2572.7
+      },
+      {
+        "target_tokens": 262144,
+        "prompt_tokens": 257634,
+        "ttft": 105.3,
+        "prefill_tok_s": 2447.6
+      }
+    ],
+    "agreement": {
+      "text": "We need answer exactly two sentences. Explain hash table and average lookup cost. Need concise. Two sentences. Mention key-value mapping via hash function to buckets, average O(1) lookup assuming good hash/load factor. Exactly two sentences. Ensure no extra.A hash table is a data structure that maps keys to"
+    }
+  }
+}

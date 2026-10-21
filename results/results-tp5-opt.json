@@ -1,0 +1,54 @@
+{
+  "layout": "tp5-opt",
+  "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+  "sizes": [
+    65536,
+    262144
+  ],
+  "tests": {
+    "smoke": {
+      "answer": "We need answer one word. Capital France = Paris. Must answer one word.Paris",
+      "ok": true
+    },
+    "tool_call": {
+      "ok": true,
+      "n_tool_calls": 1,
+      "first": "{\"id\": \"call_fcc0504523824ec7a8f3fb12\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}, \"type\": \"function\", \"index\": 0}"
+    },
+    "decode": [
+      {
+        "tag": "utf8_len",
+        "ttft": 0.34,
+        "decode_tok_s": 82.9,
+        "prompt_tokens": 70,
+        "completion_tokens": 312,
+        "chars": 1192
+      },
+      {
+        "tag": "review",
+        "ttft": 0.36,
+        "decode_tok_s": 50.5,
+        "prompt_tokens": 89,
+        "completion_tokens": 438,
+        "chars": 1632
+      }
+    ],
+    "prefill": [
+      {
+        "target_tokens": 65536,
+        "prompt_tokens": 55798,
+        "ttft": 67.8,
+        "prefill_tok_s": 823.4
+      },
+      {
+        "target_tokens": 262144,
+        "prompt_tokens": 257634,
+        "ttft": 275.3,
+        "prefill_tok_s": 935.8
+      }
+    ],
+    "agreement": {
+      "text": "We need answer exactly two sentences. Explain hash table and average lookup cost. Need concise. Exactly two sentences. Mention average O(1). Ensure exactly two sentences. Could say: \"A hash table is a data structure that stores key-value pairs by using a hash function to map keys to buckets, enabling fast insertion,"
+    }
+  }
+}
