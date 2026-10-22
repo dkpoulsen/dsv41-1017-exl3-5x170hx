@@ -1,0 +1,63 @@
+{
+  "engine": "vllm-gnmac-lab",
+  "layout": "pp5",
+  "model": "DeepSeek-V4.1-Flash-1017-hybrid",
+  "gpus": [0, 1, 2, 3, 4],
+  "gpu_type": "NVIDIA CMP 170HX 64GB (sm_80, PCIe Gen2 x4)",
+  "partition": "8,6,10,8,8",
+  "vram_per_gpu_gib": [46.6, 34.8, 47.7, 45.6, 56.6],
+  "optimizations": [
+    "PIECEWISE CUDA graphs (capture sizes 1..48)",
+    "DSpark depth 5 speculative decoding",
+    "Cooperative EXL3 MoE kernel",
+    "fp8_ds_mla KV cache",
+    "Zero All-Reduce overhead across layers"
+  ],
+  "single_stream": {
+    "structured_json_tok_s": 97.9,
+    "c_code_tok_s": 86.0,
+    "prose_tok_s": 50.5,
+    "ttft_median_s": 0.135
+  },
+  "prefill": [
+    {
+      "name": "pride-and-prejudice",
+      "tokens": 24029,
+      "wall_s": 11.20,
+      "tok_s": 2146
+    },
+    {
+      "name": "moby-dick",
+      "tokens": 34027,
+      "wall_s": 14.69,
+      "tok_s": 2317
+    },
+    {
+      "name": "war-and-peace",
+      "tokens": 38026,
+      "wall_s": 16.28,
+      "tok_s": 2336
+    }
+  ],
+  "prefill_median_tok_s": 2268,
+  "concurrency": {
+    "structured": [
+      {"users": 1, "decode_tok_s": 97.9, "aggregate_tok_s": 97.9},
+      {"users": 2, "decode_tok_s": 51.5, "aggregate_tok_s": 99.9},
+      {"users": 4, "decode_tok_s": 45.4, "aggregate_tok_s": 174.2},
+      {"users": 8, "decode_tok_s": 37.8, "aggregate_tok_s": 288.1}
+    ],
+    "code": [
+      {"users": 1, "decode_tok_s": 86.0, "aggregate_tok_s": 86.0},
+      {"users": 2, "decode_tok_s": 45.4, "aggregate_tok_s": 70.6},
+      {"users": 4, "decode_tok_s": 42.2, "aggregate_tok_s": 119.2},
+      {"users": 8, "decode_tok_s": 34.3, "aggregate_tok_s": 177.5}
+    ],
+    "prose": [
+      {"users": 1, "decode_tok_s": 50.5, "aggregate_tok_s": 50.5},
+      {"users": 2, "decode_tok_s": 27.3, "aggregate_tok_s": 53.7},
+      {"users": 4, "decode_tok_s": 18.4, "aggregate_tok_s": 71.7},
+      {"users": 8, "decode_tok_s": 14.6, "aggregate_tok_s": 113.2}
+    ]
+  }
+}

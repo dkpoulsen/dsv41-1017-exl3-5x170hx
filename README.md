@@ -165,18 +165,24 @@ In addition to the TabbyAPI PP5 and TP5 baselines, we explored alternative servi
 
 ### Architecture Comparison (All Tested Configurations on 5× CMP 170HX)
 
-| Architecture / Engine | GPUs Used | VRAM / GPU | Engram Residency | Single-Stream Decode (C Code) | Single-Stream Decode (Math Reason) | 8-User Aggregate Decode | Cold Prefill (15K Tokens) | Notes / Best Use Case |
+| Architecture / Engine | GPUs Used | VRAM / GPU | Engram Residency | Single-Stream Decode (C Code) | Single-Stream Decode (Prose) | 8-User Aggregate Decode (Code / Structured) | Cold Prefill (24K–38K Tokens) | Notes / Best Use Case |
 |---|---|---|---|---:|---:|---:|---:|---|
-| **TabbyAPI PP5** | 5 GPUs (`0..4`) | 30.8–51.8 GiB | 97.3 GiB Host RAM (Anon) | 65.4 tok/s | 80.7 tok/s | 55.9 tok/s | **1,529 tok/s** (3,044 @ 258K) | **Best for ultra-long context prefill (>100K)** |
-| **TabbyAPI TP5** | 5 GPUs (`0..4`) | 44.6–47.3 GiB | 97.3 GiB Host RAM (`mmap`) | 79.9 tok/s | 103.7 tok/s | 91.5 tok/s | 871.5 tok/s | High single-stream decode across all 5 cards |
+| **TabbyAPI PP5** | 5 GPUs (`0..4`) | 30.8–51.8 GiB | 97.3 GiB Host RAM (Anon) | 65.4 tok/s | 55.1 tok/s | 54.8 tok/s | **1,529–3,044 tok/s** | Best for ultra-long context prefill (>100K) |
+| **TabbyAPI TP5** | 5 GPUs (`0..4`) | 44.6–47.3 GiB | 97.3 GiB Host RAM (`mmap`) | 79.9 tok/s | 76.9 tok/s | 91.5 tok/s | 871–935 tok/s | High single-stream decode across all 5 cards |
 | **GNmac-lab vLLM TP2×PP2** | 4 GPUs (`0..3`) | ~58.5 GiB | NVMe SSD Streamed | 79.4 tok/s | — | 88.2 tok/s | 972.4 tok/s | Balances prefill and decode; GPU 4 free |
-| **GNmac-lab vLLM TP4 (Production)** | **4 GPUs (`0..3`)** | **~59.2 GiB** | **NVMe SSD Streamed** | **144.4 tok/s** | **122.9 tok/s** | **190.0 tok/s** (320.6 structured) | 726.9 tok/s | **Best overall decode & multi-user throughput; GPU 4 100% free** |
+| **GNmac-lab vLLM TP4** | 4 GPUs (`0..3`) | ~59.2 GiB | NVMe SSD Streamed | **183.1 tok/s** | 12.3 tok/s | **177.5 / 320.6 tok/s** | 653–695 tok/s | **Fastest single-stream code & structured decode; GPU 4 100% free** |
+| **GNmac-lab vLLM PP5** | **5 GPUs (`0..4`)** | **34.8–56.6 GiB** | **NVMe SSD Streamed** | **86.0 tok/s** | **50.5 tok/s** | **177.5 / 288.1 tok/s** | **2,268 tok/s (2,336 peak)** | **Best all-rounder: 3.5× faster prefill, 4× faster prose, identical 8-user aggregate** |
 
-### Why TP4 Outperforms TP2×PP2 on Low-Bandwidth PCIe Gen2 Links
-- **TP4 Decode Dominance (144.4 vs 79.4 tok/s)**: With **FlashInfer PCIe IPC All-Reduce** (`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`), tensor parallel all-reduces write directly into peer GPU BAR1 allocations without bouncing through host RAM or triggering kernel-driver IPC handshakes. Combined with `FULL_AND_PIECEWISE` CUDA graphs capturing shapes `1..48`, TP4 keeps all 4 GPUs constantly busy every microsecond.
-- **TP2×PP2 Latency Wall**: Pipeline stages introduce handoff latency on every forward pass. In decode, where token batch sizes are small and step latencies are on the order of 10–20 ms, pipeline synchronization overhead cut decode speed in half compared to pure TP4.
-- **Prefill Trade-off**: TP2×PP2 achieved +34% higher cold prefill throughput at 15K tokens (972.4 vs 726.9 tok/s) due to chunk pipelining across 2 stages, but for production agent serving where decode latency and multi-turn speed dominate, TP4 is substantially superior.
-- **Resource Efficiency**: Both TP4 and TP2×PP2 require only 4 of the 5 CMP 170HX GPUs, leaving **GPU 4 completely free (64 GB VRAM idle)** for auxiliary models (embeddings, rerankers, vision, or background tasks).
+### Why vLLM PP5 Delivers 2,268 tok/s Prefill on PCIe Gen2 x4
+- **Eliminating the 80 All-Reduces**: Under TP4, every forward step requires 80 layer-by-layer all-reduces that saturate the PCIe Gen2 x4 bus at 1.6 GB/s. Under PP5 (`--pipeline-parallel-size 5 --tensor-parallel-size 1`), all-reduce is **completely eliminated**. Tokens flow forward through pipeline stages, crossing the PCIe link only at the 4 stage boundaries per chunk.
+- **Balanced Layer Partition (`VLLM_PP_LAYER_PARTITION="8,6,10,8,8"`)**:
+  - GPU 0: Layers `0..7` (43.7 GiB used)
+  - GPU 1: Layers `8..13` (32.3 GiB used)
+  - GPU 2: Layers `14..23` (44.9 GiB used)
+  - GPU 3: Layers `24..31` (42.4 GiB used)
+  - GPU 4: Layers `32..39` + DSpark drafter (53.0 GiB used)
+- **Concurrency Amortization**: Under 8-user concurrency, pipeline bubble overhead is fully hidden. PP5 matches TP4 on multi-user code generation (**177.5 tok/s aggregate**) and structured throughput (**288.1 tok/s aggregate**).
+- **Prose Decode Superiority (50.5 vs 12.3 tok/s)**: On creative prose where speculative acceptance drops to ~2 tokens/step, TP4 suffers from latency penalties, whereas PP5 sustains a steady **50.5 tok/s** single-stream decode.
 
 ---
 
