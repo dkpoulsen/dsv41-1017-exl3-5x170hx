@@ -4,7 +4,7 @@ Adapting [`anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m`](https://github.com/an
 
 Three sets of changes make the full **1,048,576-token FP16 context + DSpark MTP speculative decoding + RAM-resident Engram** recipe fit comfortably and run fast on this hardware:
 
-> **Current production default (2026-10-22):** the machine now serves **GNmac-lab vLLM PP5** (`--pipeline-parallel-size 5`, all five cards, `VLLM_PP_LAYER_PARTITION="8,6,10,8,8"`) as `services.ds41-flash` on `http://127.0.0.1:8000/v1`. See [§4](#4-alternative-serving-engines--architecture-exploration) for the PP5-vs-TP4 comparison and [§6](#6-production-deployment--serving-stack) for the deployed unit. The TabbyAPI PP5 recipe below remains the reference for the ExLlamaV3 engine and ultra-long-context prefill.
+> **Current production default (2026-10-22):** the machine serves **GNmac-lab vLLM TP4** (`--tensor-parallel-size 4 --pipeline-parallel-size 1`, GPUs `0..3`) as `services.ds41-flash` on `http://127.0.0.1:8000/v1`. While PP5 achieves 2,268 tok/s cold prefill, single-stream interactive decode on PP5 collapses to 1.0–13.9 tok/s on real-world reasoning prompts due to PCIe Gen2 x4 pipeline serialization, whereas TP4 delivers **52.8–183.1 tok/s (10× to 60× faster)** and leaves GPU 4 completely free. See [§4](#4-alternative-serving-engines--architecture-exploration) and [§6](#6-production-deployment--serving-stack).
 
 1. **Pack selection (`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw`)**: LibertAI's 3.5 bpw pack quantizes the 3-layer DSpark MTP drafter to 6 bpw EXL3 (**20.0 GiB**), which only fits when parked on a 96 GB card. The 2.9 bpw family (`Mia-AiLab EAQ-v1 2.9bpw` and `LibertAIDAI 2.9bpw`) quantizes the MTP drafter to 4 bpw EXL3 (**6.75–6.88 GiB**) and the main trunk to **189.5 GiB**, fitting all 384 routed experts + 1M FP16 KV cache + MTP drafter across five 64 GB cards with 10–17 GiB/card to spare.
 2. **Offline MXFP4 (`e2m1`) Engram conversion + RAM residency (`patches/convert_engram_fp4.py`, `patches/ngram_embedding.py`)**: The base checkpoint's two Engram n-gram lookup tables (`layers.{1,14}.engram.embed.{weight,scale}`) total **188.83 GiB** in FP8 (`F8_E4M3` + `F8_E8M0`), leaving almost no breathing room on a 251 GiB host. Converting them to packed `e2m1` nibbles (`U8 [rows, 128]`) with re-computed per-32-element `F8_E8M0` power-of-two budgets (`e + 127`) halves the tables to **97.28 GiB** (`rel-L2 = 0.1205 / 0.1209` vs FP8) so the entire Engram table stays permanently in host RAM (`EXL3_NGRAM_STREAM=0`) in both **PP5** (anonymous RAM) and **TP5** (shared `mmap` across all 5 worker processes), with **>105 GiB of free RAM** remaining.
@@ -195,9 +195,25 @@ In addition to the TabbyAPI PP5 and TP5 baselines, we explored alternative servi
 | 4 (aggregate) | 174.2 | 119.2 | 71.7 |
 | 8 (aggregate) | **288.1** | **177.5** | **113.2** |
 
+### Interactive Decode Benchmark: Why PP5 Collapses on Real Prompts (1–10 tok/s vs 52–165 tok/s on TP4)
+
+While PP5 achieved high synthetic decode numbers on repetitive counter prompts with 99% speculative acceptance (`bench/mia.py`), real-world conversational and reasoning prompts revealed an acute bottleneck under PP5. On normal chat and coding requests, DSpark MTP speculative acceptance drops to 20%–40%, exposing the raw pipeline round-trip latency across the PCIe Gen2 x4 bus:
+
+| Test Prompt | Target Tokens | PP5 Decode (5 GPUs) | TP4 Decode (4 GPUs) | Speedup on TP4 |
+|---|---:|---:|---:|---:|
+| **Python Fibonacci Function** | 100 | **1.0 tok/s** (101.5 s) | **52.8 tok/s** (1.89 s) | **53× faster** |
+| **Count 1 to 100 with Commas** | 100 | **2.4 tok/s** (42.5 s) | **164.5 tok/s** (0.61 s) | **68× faster** |
+| **Explain TCP vs UDP** | 100 | **10.7 tok/s** (9.3 s) | **107.5 tok/s** (0.93 s) | **10× faster** |
+| **Roman Empire Essay** | 300 | **7.3 tok/s** (41.0 s) | **70.3 tok/s** (4.27 s) | **10× faster** |
+
+#### Root Cause Analysis:
+1. **Pipeline Bubble Serialization**: In PP5, during single-stream token generation, only 1 of the 5 GPUs is active at any microsecond (an 80% bubble). The activation vector must serialize sequentially across all 5 cards (`GPU 0 → 1 → 2 → 3 → 4`) and then back to GPU 0 for each speculative verification cycle.
+2. **PCIe Gen2 x4 Transfer Overhead**: Over downgraded Gen2 x4 risers, inter-stage P2P handshakes add 10–20 ms per hop. A full 5-stage round trip takes ~250 ms. When speculative acceptance is low (1–2 tokens accepted per step), the effective generation speed is bounded by $1\text{ token} / 0.25\text{ s} \approx 4\text{ tok/s}$.
+3. **TP4 Parallelism with FlashInfer PCIe IPC**: In TP4, all 4 GPUs compute every layer concurrently (0% pipeline bubble). FlashInfer's PCIe IPC All-Reduce writes directly into peer BAR1 allocations in microseconds. Even when 0 draft tokens are accepted, each step takes only ~15 ms, establishing a guaranteed decode floor of **>50 tok/s**.
+
 ### Deployment Decision
 
-PP5 was adopted as the production default on 2026-10-22 because it is the only configuration that is simultaneously strong on **prefill** (2,268 tok/s vs TP4's 653 tok/s), **prose/reasoning decode** (50.5 vs 12.3 tok/s), and **multi-user throughput** (parity with TP4 at 8 users), while using all five cards instead of leaving GPU 4 idle. TP4's advantage is confined to single-stream structured/code decode (216.7 / 183.1 tok/s), which matters less for agent workflows where prompts are long and turns are prefix-cached. The TP4 unit is retained in `serving/ds41-flash-tp4.nix` and can be swapped back by replacing the `ExecStart` block.
+**TP4 is the production default.** For interactive agent workflows, single-stream turn latency dominates: 53 s vs 1 s for a 100-token response makes PP5 unusable for interactive chat, whereas TP4 responds almost instantaneously while keeping GPU 4 (64 GB VRAM) free. PP5 is preserved in `serving/ds41-flash-pp5.nix` for offline batch prefill / document ingestion.
 
 ---
 
@@ -220,42 +236,30 @@ For `DeepSeek-V4.1-Flash-1017` running in reasoning / thinking mode:
 The production setup runs as a managed systemd service on NixOS 26.11:
 
 ### A. Systemd Service (`services.ds41-flash` in `serving/ds41-flash.nix`)
-- **Engine**: GNmac-lab vLLM **PP5** container (`localhost/ds41-cmp170hx:latest`)
-- **GPUs**: All 5 cards (`CUDA_VISIBLE_DEVICES=0,1,2,3,4`)
+- **Engine**: GNmac-lab vLLM **TP4** container (`localhost/ds41-cmp170hx:latest`)
+- **GPUs**: GPUs `0, 1, 2, 3` (`CUDA_VISIBLE_DEVICES=0,1,2,3`); GPU 4 is 100% free.
 - **Flags**:
-  - `--tensor-parallel-size 1 --pipeline-parallel-size 5`
-  - `VLLM_PP_LAYER_PARTITION="8,6,10,8,8"`
-  - `--disable-custom-all-reduce` (no all-reduce traffic on the PCIe Gen2 x4 bus)
+  - `--tensor-parallel-size 4 --pipeline-parallel-size 1`
+  - `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`
   - `--max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 4096`
-  - `--gpu-memory-utilization 0.92`
+  - `--gpu-memory-utilization 0.95`
   - `--kv-cache-dtype fp8_ds_mla`
-  - `--enable-prefix-caching`
+  - `--enable-prefix-caching --async-scheduling`
   - `--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`
-  - `--compilation-config '{"cudagraph_mode": "PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}'`
+  - `--compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}'`
   - `DSV41_DSPARK_V1=1 VLLM_EXL3_TC_MOE_V2=1 VLLM_EXL3_TC_MOE_PREFILL=1 VLLM_EXL3_TC_PREFILL_ROWS=4096`
-- **Per-Stage VRAM (measured at load)**:
-
-  | GPU | PP Stage | Layers | Consumed | Headroom |
-  |---|---|---|---:|---:|
-  | 0 | PP0 | 0–7 | 43.7 GiB | 19.7 GiB |
-  | 1 | PP1 | 8–13 | 32.3 GiB | 31.1 GiB |
-  | 2 | PP2 | 14–23 | 44.9 GiB | 18.5 GiB |
-  | 3 | PP3 | 24–31 | 42.4 GiB | 21.0 GiB |
-  | 4 | PP4 | 32–39 + MTP drafter | 53.0 GiB | 10.4 GiB |
-
 - **Boot Pre-warming (`ExecStartPost = "${pkgs.python3}/bin/python3 /etc/nixos/prewarm-agent.py"`)**：
   - Automatically runs after uvicorn health check passes.
   - Warms CUDA graphs, JIT-compiled kernels, and pre-populates the paged KV prefix cache with the standard `pi` system prompt (`serving/pi-system-prompt.txt`).
   - Cuts subsequent agent turn latency from **11.4 s → 1.14 s**.
-- **Measured Throughput (PP5)**:
-  - Cold prefill: **2,268 tok/s median** (2,336 peak) — 3.5× faster than TP4.
-  - Structured JSON decode: **97.9 tok/s** (TTFT 0.135 s)
-  - Python / C Code decode: **86.0 tok/s** (TTFT 0.175 s)
-  - Prose / reasoning decode: **50.5 tok/s**
-  - Concurrency: **177.5 tok/s** aggregate (8 code users), **288.1 tok/s** (8 structured users), **113.2 tok/s** (8 prose users).
+- **Measured Peak Throughput (TP4)**:
+  - Structured JSON decode: **216.7 tok/s** (TTFT 0.13 s)
+  - Python / C Code decode: **183.1 tok/s** (TTFT 0.13 s)
+  - General chat / reasoning decode: **52.8–107.5 tok/s**
+  - Concurrency: **190.0 tok/s** aggregate decode (8 general users), **320.6 tok/s** (8 structured users).
 - **Network**: Binds to `127.0.0.1:8000`
 
-> The previous TP4 service definition is preserved as `serving/ds41-flash-tp4.nix` for reference. TP4 remains the better choice if single-stream structured/code decode latency matters more than prefill throughput (216.7 / 183.1 tok/s vs 97.9 / 86.0 tok/s) and if GPU 4 must stay free.
+> The PP5 service definition is preserved as `serving/ds41-flash-pp5.nix` for offline batch document ingestion.
 
 ### B. Live Real-Time Dashboard (`vllm-tps`)
 - Dashboard listening on `http://127.0.0.1:8099`.
@@ -267,7 +271,7 @@ Configured for both `root` and standard users (`/root/.pi/agent/` and `/home/dkp
 ```json
 "providers": {
   "ds41-flash": {
-    "name": "DeepSeek-V4.1-Flash-1017 vLLM PP5",
+    "name": "DeepSeek-V4.1-Flash-1017 vLLM TP4",
     "baseUrl": "http://127.0.0.1:8000/v1",
     "api": "openai-completions",
     "apiKey": "vllm",
@@ -294,6 +298,6 @@ Configured for both `root` and standard users (`/root/.pi/agent/` and `/home/dkp
 
 - `build/` — `Containerfile`, `headers.py`, `check_engine.py`, `get_engine.sh`, `make_view.py`, `chat_template.jinja`, `tokenizer_config.json`
 - `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, `moe_coop/` (the 4 C++/CUDA MoE kernel patches + unified diffs), and the 9 patched engine modules (`row_table.py`, `generator.py`, `ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
-- `serving/` — `ds41-flash.nix` (NixOS vLLM **PP5** production service), `ds41-flash-tp4.nix` (previous TP4 service, kept for reference), `prewarm-agent.py` (systemd boot prewarmer), `pi-system-prompt.txt` (reference agent prompt), `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS TabbyAPI PP5 service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
+- `serving/` — `ds41-flash.nix` (NixOS vLLM **TP4** production service), `ds41-flash-pp5.nix` (NixOS vLLM PP5 service for bulk prefill), `prewarm-agent.py` (systemd boot prewarmer), `pi-system-prompt.txt` (reference agent prompt), `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS TabbyAPI PP5 service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
 - `bench/` — `bench_ab.py`, `bench_conc.py`, `compare.py`, `capture_ref.py`
 - `results/` — `results-vllm-tp4.json`, `results-vllm-pp2tp2.json`, `results-vllm-pp5.json`, `results-tp5*.json`, `results-pp5*.json`, `results-conc-*.json`, `ref-*.json`, `convert.log`
