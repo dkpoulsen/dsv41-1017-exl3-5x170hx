@@ -23,7 +23,7 @@ let
 
   launcher = pkgs.writeShellScript "ds41-flash-run" ''
     set -eu
-    ${podman} rm -f --ignore ds41-flash ds41-flash-test ds41-flash-pp2tp2 >/dev/null 2>&1 || true
+    ${podman} rm -f --ignore ds41-flash ds41-flash-test ds41-flash-pp2tp2 ds41-debug >/dev/null 2>&1 || true
     exec ${podman} run --rm --replace \
       --name ds41-flash \
       --device nvidia.com/gpu=all --ipc=host \
@@ -33,7 +33,7 @@ let
       -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
       -e VLLM_PLUGINS=vllm_exl3 -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e VLLM_EXL3_MODEL_DIR="/models/DeepSeek-V4.1-Flash-1017-hybrid" \
       -e VLLM_USE_V2_MODEL_RUNNER=0 -e DSV41_DSPARK_V1=1 -e VLLM_EXL3_COOP=1 \
-      -e VLLM_EXL3_TC_MOE_V2=1 -e VLLM_EXL3_TC_MOE_PREFILL=1 -e VLLM_EXL3_TC_PREFILL_ROWS=2048 \
+      -e VLLM_EXL3_TC_MOE_V2=1 -e VLLM_EXL3_TC_MOE_PREFILL=1 -e VLLM_EXL3_TC_PREFILL_ROWS=4096 \
       -e VLLM_EXL3_TC_MOE_SO=/opt/dsv41-tc-moe/_dsv41_tc_moe_C.abi3.so -e VLLM_EXL3_TC_HOOK=/opt/dsv41-tc-moe/exl3_tc_hook.py \
       -e VLLM_EXL3_MOE_TP_ALIGN=128 -e VLLM_EXL3_MOE_TP_ROTATE=1 \
       -e NCCL_CUMEM_ENABLE=0 -e NCCL_CUMEM_HOST_ENABLE=0 -e NCCL_P2P_LEVEL=SYS \
@@ -55,8 +55,8 @@ let
       --tensor-parallel-size 4 --pipeline-parallel-size 1 \
       --served-model-name deepseek-v4.1-flash \
       --host 0.0.0.0 --port 8000 \
-      --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 2048 \
-      --gpu-memory-utilization 0.92 \
+      --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 4096 \
+      --gpu-memory-utilization 0.95 \
       --kv-cache-dtype fp8_ds_mla --enable-prefix-caching \
       --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}' \
       --async-scheduling \
@@ -85,6 +85,7 @@ in
         TimeoutStopSec = "60s";
         Environment = podmanEnv;
         ExecStart = "${launcher}";
+        ExecStartPost = "${pkgs.python3}/bin/python3 /etc/nixos/prewarm-agent.py";
         Restart = "on-failure";
         RestartSec = 5;
       };

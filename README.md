@@ -203,12 +203,23 @@ The production setup runs as a managed systemd service on NixOS 26.11:
 - **GPUs**: GPUs `0, 1, 2, 3` (`CUDA_VISIBLE_DEVICES=0,1,2,3`)
 - **Flags**:
   - `--tensor-parallel-size 4 --pipeline-parallel-size 1`
+  - `--max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 4096`
+  - `--gpu-memory-utilization 0.95`
   - `--kv-cache-dtype fp8_ds_mla`
   - `--enable-prefix-caching --async-scheduling`
   - `--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`
   - `--compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}'`
   - `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`
-  - `DSV41_DSPARK_V1=1 VLLM_EXL3_TC_MOE_V2=1 VLLM_EXL3_TC_MOE_PREFILL=1`
+  - `DSV41_DSPARK_V1=1 VLLM_EXL3_TC_MOE_V2=1 VLLM_EXL3_TC_MOE_PREFILL=1 VLLM_EXL3_TC_PREFILL_ROWS=4096`
+- **Boot Pre-warming (`ExecStartPost = "${pkgs.python3}/bin/python3 /etc/nixos/prewarm-agent.py"`)**:
+  - Automatically runs after uvicorn health check passes.
+  - Warms CUDA graphs, JIT-compiled kernels, and pre-populates the paged KV prefix cache with the standard `pi` system prompt (`serving/pi-system-prompt.txt`).
+  - Cuts subsequent agent turn latency from **11.4 s → 1.14 s**.
+- **Measured Peak Throughput**:
+  - Structured JSON decode: **216.7 tok/s** (TTFT 0.13 s)
+  - Python / C Code decode: **183.1 tok/s** (TTFT 0.13 s)
+  - Math reasoning: **122.9 tok/s**
+  - Concurrency: **190.0 tok/s** aggregate decode (8 general users), **320.6 tok/s** (8 structured users).
 - **Network**: Binds to `127.0.0.1:8000`
 
 ### B. Live Real-Time Dashboard (`vllm-tps`)
@@ -248,6 +259,6 @@ Configured for both `root` and standard users (`/root/.pi/agent/` and `/home/dkp
 
 - `build/` — `Containerfile`, `headers.py`, `check_engine.py`, `get_engine.sh`, `make_view.py`, `chat_template.jinja`, `tokenizer_config.json`
 - `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, `moe_coop/` (the 4 C++/CUDA MoE kernel patches + unified diffs), and the 9 patched engine modules (`row_table.py`, `generator.py`, `ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
-- `serving/` — `ds41-flash.nix` (NixOS vLLM TP4 service), `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS TabbyAPI PP5 service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
+- `serving/` — `ds41-flash.nix` (NixOS vLLM TP4 service), `prewarm-agent.py` (systemd boot prewarmer), `pi-system-prompt.txt` (reference agent prompt), `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS TabbyAPI PP5 service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
 - `bench/` — `bench_ab.py`, `bench_conc.py`, `compare.py`, `capture_ref.py`
 - `results/` — `results-vllm-tp4.json`, `results-vllm-pp2tp2.json`, `results-tp5*.json`, `results-pp5*.json`, `results-conc-*.json`, `ref-*.json`, `convert.log`
