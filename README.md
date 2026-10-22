@@ -159,10 +159,95 @@ Adapted core Ampere breakthroughs from [`HalfVulpes/Deepinfer-SM80`](https://git
 
 ---
 
+## 4. Alternative Serving Engines & Architecture Exploration
+
+In addition to the TabbyAPI PP5 and TP5 baselines, we explored alternative serving architectures using the **GNmac-lab vLLM** stack (`localhost/ds41-cmp170hx:latest`), an Ampere-optimized fork of vLLM V1 with standalone C++/CUDA MoE kernels (`DeepSeekv41-Flash-EXL3-TC-MoE`), FlashInfer 0.7.0.post1 PCIe IPC all-reduce, and SSD-streamed Engram tables.
+
+### Architecture Comparison (All Tested Configurations on 5× CMP 170HX)
+
+| Architecture / Engine | GPUs Used | VRAM / GPU | Engram Residency | Single-Stream Decode (C Code) | Single-Stream Decode (Math Reason) | 8-User Aggregate Decode | Cold Prefill (15K Tokens) | Notes / Best Use Case |
+|---|---|---|---|---:|---:|---:|---:|---|
+| **TabbyAPI PP5** | 5 GPUs (`0..4`) | 30.8–51.8 GiB | 97.3 GiB Host RAM (Anon) | 65.4 tok/s | 80.7 tok/s | 55.9 tok/s | **1,529 tok/s** (3,044 @ 258K) | **Best for ultra-long context prefill (>100K)** |
+| **TabbyAPI TP5** | 5 GPUs (`0..4`) | 44.6–47.3 GiB | 97.3 GiB Host RAM (`mmap`) | 79.9 tok/s | 103.7 tok/s | 91.5 tok/s | 871.5 tok/s | High single-stream decode across all 5 cards |
+| **GNmac-lab vLLM TP2×PP2** | 4 GPUs (`0..3`) | ~58.5 GiB | NVMe SSD Streamed | 79.4 tok/s | — | 88.2 tok/s | 972.4 tok/s | Balances prefill and decode; GPU 4 free |
+| **GNmac-lab vLLM TP4 (Production)** | **4 GPUs (`0..3`)** | **~59.2 GiB** | **NVMe SSD Streamed** | **144.4 tok/s** | **122.9 tok/s** | **190.0 tok/s** (320.6 structured) | 726.9 tok/s | **Best overall decode & multi-user throughput; GPU 4 100% free** |
+
+### Why TP4 Outperforms TP2×PP2 on Low-Bandwidth PCIe Gen2 Links
+- **TP4 Decode Dominance (144.4 vs 79.4 tok/s)**: With **FlashInfer PCIe IPC All-Reduce** (`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`), tensor parallel all-reduces write directly into peer GPU BAR1 allocations without bouncing through host RAM or triggering kernel-driver IPC handshakes. Combined with `FULL_AND_PIECEWISE` CUDA graphs capturing shapes `1..48`, TP4 keeps all 4 GPUs constantly busy every microsecond.
+- **TP2×PP2 Latency Wall**: Pipeline stages introduce handoff latency on every forward pass. In decode, where token batch sizes are small and step latencies are on the order of 10–20 ms, pipeline synchronization overhead cut decode speed in half compared to pure TP4.
+- **Prefill Trade-off**: TP2×PP2 achieved +34% higher cold prefill throughput at 15K tokens (972.4 vs 726.9 tok/s) due to chunk pipelining across 2 stages, but for production agent serving where decode latency and multi-turn speed dominate, TP4 is substantially superior.
+- **Resource Efficiency**: Both TP4 and TP2×PP2 require only 4 of the 5 CMP 170HX GPUs, leaving **GPU 4 completely free (64 GB VRAM idle)** for auxiliary models (embeddings, rerankers, vision, or background tasks).
+
+---
+
+## 5. Sampling Parameter Recommendations: Temperature & Top-P
+
+For `DeepSeek-V4.1-Flash-1017` running in reasoning / thinking mode:
+
+| Parameter | Recommended Value | Rationale |
+|---|---|---|
+| **`temperature`** | **`0.6`** | Recommended by DeepSeek for reasoning models (DeepSeek-R1 / V4 reasoning mode). Setting `temperature = 0.0` (greedy) causes reasoning chains to fall into repetition loops or fail to backtrack on complex multi-step reasoning. Setting `temperature > 0.8` degrades mathematical syntax and formatting stability. `0.6` provides optimal balance. |
+| **`top_p`** | **`0.95`** | Nucleus sampling cutoff that prevents low-probability hallucinations in tail distributions while preserving exploratory thinking paths. |
+| **`max_tokens`** | **`65536`** | Provides headroom for deep reasoning traces prior to final answers. |
+
+*Note: For strict, non-reasoning deterministic tasks (e.g. unit test assertions, fixed schema extractions), `temperature: 0.0` (greedy) can be used.*
+
+---
+
+## 6. Production Deployment & Serving Stack
+
+The production setup runs as a managed systemd service on NixOS 26.11:
+
+### A. Systemd Service (`services.ds41-flash` in `serving/ds41-flash.nix`)
+- **Engine**: GNmac-lab vLLM TP4 container (`localhost/ds41-cmp170hx:latest`)
+- **GPUs**: GPUs `0, 1, 2, 3` (`CUDA_VISIBLE_DEVICES=0,1,2,3`)
+- **Flags**:
+  - `--tensor-parallel-size 4 --pipeline-parallel-size 1`
+  - `--kv-cache-dtype fp8_ds_mla`
+  - `--enable-prefix-caching --async-scheduling`
+  - `--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`
+  - `--compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}'`
+  - `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`
+  - `DSV41_DSPARK_V1=1 VLLM_EXL3_TC_MOE_V2=1 VLLM_EXL3_TC_MOE_PREFILL=1`
+- **Network**: Binds to `127.0.0.1:8000`
+
+### B. Live Real-Time Dashboard (`vllm-tps`)
+- Dashboard listening on `http://127.0.0.1:8099`.
+- Polls Prometheus metrics from `http://127.0.0.1:8000/metrics` every second.
+- Tracks generation tok/s, prompt compute tok/s, KV cache utilization, and active request concurrency for `deepseek-v4.1-flash`.
+
+### C. Agent CLI Integration (`pi`)
+Configured for both `root` and standard users (`/root/.pi/agent/` and `/home/dkp/.pi/agent/`):
+```json
+"providers": {
+  "ds41-flash": {
+    "name": "DeepSeek-V4.1-Flash-1017 vLLM TP4",
+    "baseUrl": "http://127.0.0.1:8000/v1",
+    "api": "openai-completions",
+    "apiKey": "vllm",
+    "compat": {
+      "supportsDeveloperRole": false,
+      "thinkingFormat": "chat-template"
+    },
+    "models": [
+      {
+        "id": "deepseek-v4.1-flash",
+        "reasoning": true,
+        "contextWindow": 262144,
+        "maxTokens": 65536,
+        "samplingParams": { "temperature": 0.6, "top_p": 0.95 }
+      }
+    ]
+  }
+}
+```
+
+---
+
 ## Repository Layout
 
 - `build/` — `Containerfile`, `headers.py`, `check_engine.py`, `get_engine.sh`, `make_view.py`, `chat_template.jinja`, `tokenizer_config.json`
 - `patches/` — `convert_engram_fp4.py`, `all_optimizations.patch`, `moe_coop/` (the 4 C++/CUDA MoE kernel patches + unified diffs), and the 9 patched engine modules (`row_table.py`, `generator.py`, `ngram_embedding.py`, `deepseek_v41_mod.py`, `dsv4.py`, `dspark.py`, `dsa.py`, `model_ls.py`, `device_copy.py`)
-- `serving/` — `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS systemd service with `dsparkConf` and `yocoCompact`), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
+- `serving/` — `ds41-flash.nix` (NixOS vLLM TP4 service), `ds41-mia-tp5.yml`, `ds41-mia-pp5.yml`, `ds41-mia.nix` (NixOS TabbyAPI PP5 service), `run-mia.sh`, `run-fg.sh`, `prewarm-engram.sh`
 - `bench/` — `bench_ab.py`, `bench_conc.py`, `compare.py`, `capture_ref.py`
-- `results/` — `results-tp5*.json`, `results-pp5*.json`, `results-conc-*.json`, `ref-*.json`, `convert.log`
+- `results/` — `results-vllm-tp4.json`, `results-vllm-pp2tp2.json`, `results-tp5*.json`, `results-pp5*.json`, `results-conc-*.json`, `ref-*.json`, `convert.log`

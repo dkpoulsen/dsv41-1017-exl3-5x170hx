@@ -1,0 +1,47 @@
+{
+  "engine": "vllm-gnmac-lab",
+  "layout": "pp2-tp2",
+  "model": "DeepSeek-V4.1-Flash-1017-hybrid",
+  "gpus": [0, 1, 2, 3],
+  "gpu_type": "NVIDIA CMP 170HX 64GB (sm_80, PCIe Gen2 x4)",
+  "idle_gpus": [4],
+  "partition": "22,18",
+  "optimizations": [
+    "PIECEWISE CUDA graphs (capture sizes 1..48)",
+    "DSpark depth 5 speculative decoding",
+    "TC-MoE standalone kernel",
+    "fp8_ds_mla KV cache"
+  ],
+  "single_stream": {
+    "c_code_tok_s": 79.4
+  },
+  "prefill": [
+    {
+      "prompt_tokens": 15186,
+      "ttft_s": 15.62,
+      "prefill_tok_s": 972.4
+    }
+  ],
+  "concurrency": [
+    {
+      "users": 1,
+      "decode_tok_s": 90.3,
+      "aggregate_tok_s": 90.3
+    },
+    {
+      "users": 2,
+      "decode_tok_s": 80.7,
+      "aggregate_tok_s": 92.4
+    },
+    {
+      "users": 4,
+      "decode_tok_s": 94.2,
+      "aggregate_tok_s": 95.8
+    },
+    {
+      "users": 8,
+      "decode_tok_s": 88.2,
+      "aggregate_tok_s": 89.6
+    }
+  ]
+}
