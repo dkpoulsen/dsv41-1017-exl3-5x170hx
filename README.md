@@ -289,9 +289,18 @@ The production setup runs as a managed systemd service on NixOS 26.11:
   - Concurrency: **190.0 tok/s** aggregate decode (8 general users), **320.6 tok/s** (8 structured users).
 - **Network**: Binds to `127.0.0.1:8000`
 
-> The PP5 service definition is preserved as `serving/ds41-flash-pp5.nix` for offline batch document ingestion.
+> The PP5 service definition is preserved as `serving/ds41-flash-pp5.nix` for 5-GPU offline batch document ingestion, and `serving/ds41-flash-pp4.nix` provides the 4-GPU pipeline-parallel configuration (`--tensor-parallel-size 1 --pipeline-parallel-size 4`, `VLLM_PP_LAYER_PARTITION=10,11,11,8`, PIECEWISE CUDA graphs).
 
-### B. Live Real-Time Dashboard (`vllm-tps`)
+### B. PP4 Serving Layout (`serving/ds41-flash-pp4.nix`)
+- **Engine**: GNmac-lab vLLM **PP4** container (`localhost/ds41-cmp170hx:1.1.0`)
+- **Partition**: `10, 11, 11, 8` layers across GPUs `0..3`.
+- **Characteristics**:
+  - Eliminates all-reduce across GPUs; only inter-stage activations are transferred over PCIe links.
+  - Cold prefill reaches **1,080–1,628 tok/s** (+30% to +105% faster prefill than TP4 over PCIe Gen2 x4).
+  - Single-user decode throughput: **53.0–75.0 tok/s** (mean: **64.4 tok/s** on C workloads).
+  - Preserves GPU 4 (64 GB) 100% free.
+
+### C. Live Real-Time Dashboard (`vllm-tps`)
 - Dashboard listening on `http://127.0.0.1:8099`.
 - Polls Prometheus metrics from `http://127.0.0.1:8000/metrics` every second.
 - Tracks generation tok/s, prompt compute tok/s, KV cache utilization, and active request concurrency for `deepseek-v4.1-flash`.
