@@ -206,6 +206,27 @@ While PP5 achieved high synthetic decode numbers on repetitive counter prompts w
 | **Explain TCP vs UDP** | 100 | **10.7 tok/s** (9.3 s) | **107.5 tok/s** (0.93 s) | **10× faster** |
 | **Roman Empire Essay** | 300 | **7.3 tok/s** (41.0 s) | **70.3 tok/s** (4.27 s) | **10× faster** |
 
+### Standardized Nine-Request C-Coding Benchmark (Recipe 08/09 Protocol)
+
+Using the standardized 9-request systems C-coding benchmark protocol from [`anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m`](https://github.com/anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m) (`bench/bench_nine_requests.py`), measured greedy against the live server:
+
+| Request | Prompt Tokens | Time to First Token (TTFT) | Prefill Throughput | Completion Tokens | Decode Throughput |
+|---|---:|---:|---:|---:|---:|
+| **`review`** | 4,464 | 5.89 s | 758 tok/s | 1,500 | **115.1 tok/s** |
+| **`bug-find`** | 3,150 | 3.75 s | 840 tok/s | 600 | **122.8 tok/s** |
+| **`fix-diff`** | 3,142 | 3.73 s | 843 tok/s | 350 | **139.1 tok/s** |
+| **`fix-func`** | 3,148 | 3.72 s | 846 tok/s | 1,200 | **138.7 tok/s** |
+| **`whole-file`** | 1,626 | 2.07 s | 784 tok/s | 2,600 | **147.0 tok/s** |
+| **`agent-edit` (tools)** | 3,492 | 4.33 s | 806 tok/s | 154 | **112.2 tok/s** |
+| **`agent-multi` (tools)** | 8,252 | 10.51 s | 785 tok/s | 212 | **124.5 tok/s** |
+| **`new-code`** | 73 | 0.21 s | 341 tok/s | 1,500 | **133.7 tok/s** |
+| **`explain`** | 4,463 | 5.45 s | 819 tok/s | 1,000 | **100.3 tok/s** |
+
+- **Mean per-request decode**: **125.9 tok/s** (vs reference repo's 99.9 tok/s — **+26.0% faster** on our GNmac-lab vLLM TP4 stack).
+- **Total output**: **9,116 completion tokens** in 110.6 s (**82.4 tok/s wall throughput** including prefill and round-trip overhead).
+- **INT8 Lightning Indexer**: Prefill scoring in INT8 (`VLLM_DSV4_INDEXER_DTYPE=int8`, `patches/mqa_logits_triton.py`) reduces operand transfer across the memory bus by 50% and runs on native Ampere INT8 tensor cores.
+- **GPU Persistence Mode**: Initialised at boot via `systemd.services.nvidia-persistence` (`nvidia-smi -pm 1`), eliminating power-state clock latency.
+
 #### Root Cause Analysis:
 1. **Pipeline Bubble Serialization**: In PP5, during single-stream token generation, only 1 of the 5 GPUs is active at any microsecond (an 80% bubble). The activation vector must serialize sequentially across all 5 cards (`GPU 0 → 1 → 2 → 3 → 4`) and then back to GPU 0 for each speculative verification cycle.
 2. **PCIe Gen2 x4 Transfer Overhead**: Over downgraded Gen2 x4 risers, inter-stage P2P handshakes add 10–20 ms per hop. A full 5-stage round trip takes ~250 ms. When speculative acceptance is low (1–2 tokens accepted per step), the effective generation speed is bounded by $1\text{ token} / 0.25\text{ s} \approx 4\text{ tok/s}$.

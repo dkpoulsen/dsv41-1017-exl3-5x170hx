@@ -43,8 +43,10 @@ let
       -e VLLM_DSV41_DECODE_SPLITK=1 -e DSV41_SHARED_HEAVY_BLOCKS=1 \
       -e DSV41_PREFILL_CHUNK_REQS=1 -e DSV41_INDEXER_BUF_MULT=4 \
       -e VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1 \
+      -e VLLM_DSV4_INDEXER_DTYPE=int8 \
       -p 127.0.0.1:8000:8000 \
       -v /home/dkp/models:/models:ro \
+      -v /home/dkp/ds41-flash-patches/mqa_logits_triton.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/mqa_logits_triton.py:ro \
       -v /home/dkp/gnmac-lab/cache/root-cache:/root/.cache \
       -v /home/dkp/gnmac-lab/cache/triton:/root/.triton \
       -v /home/dkp/gnmac-lab/cache/tilelang:/root/.tilelang \
@@ -71,6 +73,19 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Keep the GPUs initialised between requests (avoids clock-ramp and
+    # driver-unload latency on the first token after an idle period).
+    systemd.services.nvidia-persistence = {
+      description = "Enable NVIDIA persistence mode";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-modules-load.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${config.boot.kernelPackages.nvidia_x11_latest.bin}/bin/nvidia-smi -pm 1";
+      };
+    };
+
     systemd.services.ds41-flash = {
       description = "DeepSeek-V4.1-Flash GNmac-lab vLLM TP4 serving engine";
       wants = [ "network-online.target" ];
