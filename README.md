@@ -208,22 +208,31 @@ While PP5 achieved high synthetic decode numbers on repetitive counter prompts w
 
 ### Standardized Nine-Request C-Coding Benchmark (Recipe 08/09 Protocol)
 
-Using the standardized 9-request systems C-coding benchmark protocol from [`anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m`](https://github.com/anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m) (`bench/bench_nine_requests.py`), measured greedy against the live server:
+Using the standardized 9-request systems C-coding benchmark protocol from [`anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m`](https://github.com/anoane/09-deepseek-v41-flash-1017-exl3-tp5-1m) (`bench/bench_nine_requests.py`), measured greedy against the live server on GNmac-lab vLLM TP4 **v1.1.0**:
 
-| Request | Prompt Tokens | Time to First Token (TTFT) | Prefill Throughput | Completion Tokens | Decode Throughput |
-|---|---:|---:|---:|---:|---:|
-| **`review`** | 4,464 | 5.89 s | 758 tok/s | 1,500 | **115.1 tok/s** |
-| **`bug-find`** | 3,150 | 3.75 s | 840 tok/s | 600 | **122.8 tok/s** |
-| **`fix-diff`** | 3,142 | 3.73 s | 843 tok/s | 350 | **139.1 tok/s** |
-| **`fix-func`** | 3,148 | 3.72 s | 846 tok/s | 1,200 | **138.7 tok/s** |
-| **`whole-file`** | 1,626 | 2.07 s | 784 tok/s | 2,600 | **147.0 tok/s** |
-| **`agent-edit` (tools)** | 3,492 | 4.33 s | 806 tok/s | 154 | **112.2 tok/s** |
-| **`agent-multi` (tools)** | 8,252 | 10.51 s | 785 tok/s | 212 | **124.5 tok/s** |
-| **`new-code`** | 73 | 0.21 s | 341 tok/s | 1,500 | **133.7 tok/s** |
-| **`explain`** | 4,463 | 5.45 s | 819 tok/s | 1,000 | **100.3 tok/s** |
+| Request | Prompt Tokens | Time to First Token (TTFT, cold) | Prefill (cold) | Completion Tokens | Decode (1.0.0) | **Decode (1.1.0)** | Speedup vs 1.0.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **`review`** | 4,464 | 5.46 s | 817 tok/s | 1,500 | 115.1 tok/s | **136.5 tok/s** | +18.6% |
+| **`bug-find`** | 3,150 | 3.75 s | 840 tok/s | 600 | 122.8 tok/s | **143.0 tok/s** | +16.4% |
+| **`fix-diff`** | 3,142 | 3.73 s | 841 tok/s | 350 | 139.1 tok/s | **128.4 tok/s** | −7.7% |
+| **`fix-func`** | 3,148 | 3.75 s | 839 tok/s | 1,200 | 138.7 tok/s | **156.2 tok/s** | +12.6% |
+| **`whole-file`** | 1,626 | 2.06 s | 790 tok/s | 2,600 | 147.0 tok/s | **176.9 tok/s** | +20.3% |
+| **`agent-edit` (tools)** | 3,492 | 4.29 s | 814 tok/s | 154 | 112.2 tok/s | **134.5 tok/s** | +19.9% |
+| **`agent-multi` (tools)** | 8,252 | 10.41 s | 793 tok/s | 212 | 124.5 tok/s | **138.4 tok/s** | +11.2% |
+| **`new-code`** | 73 | 0.21 s | 352 tok/s | 1,500 | 133.7 tok/s | **141.9 tok/s** | +6.1% |
+| **`explain`** | 4,463 | 5.74 s | 778 tok/s | 1,000 | 100.3 tok/s | **117.6 tok/s** | +17.2% |
 
-- **Mean per-request decode**: **125.9 tok/s** (vs reference repo's 99.9 tok/s — **+26.0% faster** on our GNmac-lab vLLM TP4 stack).
-- **Total output**: **9,116 completion tokens** in 110.6 s (**82.4 tok/s wall throughput** including prefill and round-trip overhead).
+- **Mean per-request decode**: **141.5 tok/s** cold / **145.0 tok/s** warm cache (vs 1.0.0's 125.9 tok/s — **+12.4% to +15.2% faster**; vs reference repo's 99.9 tok/s — **+41.6% faster**).
+- **Total output**: **9,116 completion tokens** in 101.4 s cold (**89.9 tok/s wall throughput**) and 63.8 s warm prefix (**142.9 tok/s wall throughput**).
+- **GNmac-lab 1.1.0 Engine Upgrades**:
+  - MXFP8 linears on one fragment-native weight copy (`dsv41_fp8w_ext` GEMV for $M \le 8$, smem-staged kernel for $M \le 64$).
+  - Decode $w_{o\_a}$ CUDA kernel (`dsv41_woa_ext`) with fused inverse GPT-J RoPE.
+  - Cooperative MoE decode loop instruction reduction (7.33 $\to$ 6.39 instructions per weight).
+  - Draft-only FP8 drafter head shard (`DSV41_DRAFT_HEAD_FP8=1`).
+  - DSpark Markov sampling loop as a single CUDA graph with fused bias GEMV and max kernels.
+  - Greedy verification using vocab-parallel argmax IDs directly (skips 2 full-vocab passes).
+  - Runtime variants: `dsv41_topk_meta` (1 launch vs 5), `dsv41_h2d_lean`, `dsv41_ragged_lean`.
+  - **PCIe Gen2 x4 Finding on Confidence Gating (`DSV41_GATE_TAU=0`)**: The upstream 1.1.0 default `DSV41_GATE_TAU=0.10` gates out drafts in reasoning prose when drafter confidence drops. On a machine with PCIe Gen2 x16 links, 1-token decode steps take ~17 ms. However, on physical PCIe Gen2 x4 links, a single un-speculated token step requires ~60 ms ($1 / 0.060 \approx 16.6\text{ tok/s}$). Amortizing PCIe all-reduce latency requires keeping speculative decoding active. Setting `DSV41_GATE_TAU=0` keeps all 5 drafts verified, sustaining >115 tok/s on reasoning prose and 140–177 tok/s on code.
 - **INT8 Lightning Indexer**: Prefill scoring in INT8 (`VLLM_DSV4_INDEXER_DTYPE=int8`, `patches/mqa_logits_triton.py`) reduces operand transfer across the memory bus by 50% and runs on native Ampere INT8 tensor cores.
 - **GPU Persistence Mode**: Initialised at boot via `systemd.services.nvidia-persistence` (`nvidia-smi -pm 1`), eliminating power-state clock latency.
 

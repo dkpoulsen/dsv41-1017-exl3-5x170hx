@@ -42,6 +42,9 @@ let
       -e TORCH_CUDA_ARCH_LIST=8.0 -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor \
       -e VLLM_DSV41_DECODE_SPLITK=1 -e DSV41_SHARED_HEAVY_BLOCKS=1 \
       -e DSV41_PREFILL_CHUNK_REQS=1 -e DSV41_INDEXER_BUF_MULT=4 \
+      -e DSV41_DRAFT_HEAD_FP8=1 \
+      -e DSV41_VARIANTS=dsv41_topk_meta,dsv41_h2d_lean,dsv41_ragged_lean,dsv41_gate \
+      -e DSV41_GATE_TAU=0 \
       -e VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1 \
       -e VLLM_DSV4_INDEXER_DTYPE=int8 \
       -p 127.0.0.1:8000:8000 \
@@ -51,7 +54,7 @@ let
       -v /home/dkp/gnmac-lab/cache/triton:/root/.triton \
       -v /home/dkp/gnmac-lab/cache/tilelang:/root/.tilelang \
       --entrypoint vllm \
-      localhost/ds41-cmp170hx:latest \
+      localhost/ds41-cmp170hx:1.1.0 \
       serve /models/DeepSeek-V4.1-Flash-1017-hybrid \
       --quantization exl3 --load-format safetensors --safetensors-load-strategy lazy \
       --tensor-parallel-size 4 --pipeline-parallel-size 1 \
